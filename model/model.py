@@ -114,10 +114,18 @@ class MyInklingRelativeLogits(nn.Module):
 class MyInklingRMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.eps = eps
+        self.variance_epsilon = eps
 
         self.weight = nn.Parameter(torch.ones(hidden_size))
+
+    def forward(
+        self, hidden_states: Float[T, "... hidden_size"]
+    ) -> Float[T, "... hidden_size"]:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.float()
+        variance: Float[T, "... 1"] = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
 
 
 class MyInklingMLP(nn.Module):
@@ -134,6 +142,13 @@ class MyInklingMLP(nn.Module):
 
         self.act_fn = ACT2FN[config.hidden_act]
         self.global_scale = nn.Parameter(torch.ones(1))
+
+    def forward(
+        self, hidden_states: Float[T, "bs seq_len hidden_size"]
+    ) -> Float[T, "bs seq_len hidden_size"]:
+        gate = self.act_fn(self.gate_proj(hidden_states))
+        up = self.up_proj(hidden_states)
+        return self.down_proj(gate * up) * self.global_scale
 
 
 class MyInklingSharedExperts(nn.Module):
