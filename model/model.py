@@ -169,6 +169,45 @@ class MyInklingSharedExperts(nn.Module):
         )
         self.act_fn = ACT2FN[config.hidden_act]
 
+    def forward(
+        self,
+        hidden_states: Float[T, "bs seq_len hidden_size"],
+        gammas: Float[T, "bs*seq_len n_shared"],
+    ) -> Float[T, "bs seq_len hidden_size"]:
+        """
+        tok = bs * seq_len
+        s = seq_len
+        d = intermediate dim
+        h = hidden_size
+        """
+        input_shape = hidden_states.shape
+
+        hidden_states: Float[T, "n_shared tok h"] = repeat(
+            hidden_states,
+            "bs s h -> n_shared (bs s) h",
+            n_shared=self.n_shared_experts,
+        )
+
+        gammas = rearrange(gammas, "tok n_shared -> n_shared tok 1")
+
+        gate = torch.bmm(
+            hidden_states,
+            rearrange(self.gate_proj, "n_shared d h -> n_shared h d"),
+        )
+        up = torch.bmm(
+            hidden_states,
+            rearrange(self.up_proj, "n_shared d h -> n_shared h d"),
+        )
+
+        activated: Float[T, "n_shared tok d"] = self.act_fn(gate) * up * gammas
+
+        down: Float[T, "n_shared tok h"] = torch.bmm(
+            activated,
+            rearrange(self.down_proj, "n_shared h d -> n_shared d h"),
+        )
+        out: Float[T, "tok h"] = down.float().sum(dim=0).to(hidden_states.dtype)
+        return out.view(input_shape)
+
 
 class MyInklingExperts(nn.Module):
     def __init__(self, config: InklingTextConfig):
