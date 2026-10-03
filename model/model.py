@@ -607,6 +607,37 @@ class MyInklingDecoderLayer(nn.Module):
             config.hidden_size, config.conv_kernel_size, layer_idx=layer_idx, conv_idx=3
         )
 
+    def forward(
+        self,
+        hidden_states: Fp[T, "bs s d"],
+        attention_mask: Fp[T, "#bs 1 s k_len"] | None = None,
+        conv_mask: Bool[T, "bs s"] | None = None,
+        past_key_values: Cache | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> Fp[T, "bs s d"]:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            conv_mask=conv_mask,
+            past_key_values=past_key_values,
+            **kwargs,
+        )
+        hidden_states = self.attn_sconv(
+            hidden_states, past_key_values=past_key_values, conv_mask=conv_mask
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp_sconv(
+            hidden_states, past_key_values=past_key_values, conv_mask=conv_mask
+        )
+        hidden_states = residual + hidden_states
+        return hidden_states
+
 
 class MyInklingTextTower(nn.Module):
     def __init__(self, config: InklingTextConfig):
