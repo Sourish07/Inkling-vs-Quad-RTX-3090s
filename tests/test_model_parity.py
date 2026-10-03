@@ -402,7 +402,8 @@ def test_vision_tower_fp32(config: InklingConfig) -> None:
 @pytest.mark.parametrize(
     "with_lm_head", [False, True], ids=["model", "conditional_generation"]
 )
-def test_model_fp32(with_lm_head: bool, config: InklingConfig) -> None:
+@pytest.mark.parametrize("input_kind", ["ids", "embeddings"])
+def test_model_fp32(with_lm_head: bool, input_kind: str, config: InklingConfig) -> None:
     if with_lm_head:
         actual = inkling.MyInkling(config)
         reference = hf.InklingForConditionalGeneration(config)
@@ -417,8 +418,43 @@ def test_model_fp32(with_lm_head: bool, config: InklingConfig) -> None:
     # model.py does not yet define an audio module.
     actual, reference = pair(actual, reference, ignored_prefixes=ignored)
     ids, mask = tokens_and_mask()
-    expected = getattr(
-        reference(input_ids=ids, attention_mask=mask, use_cache=False), output_field
+    embedding = (
+        reference.model.language_model.embed_tokens
+        if with_lm_head
+        else reference.language_model.embed_tokens
     )
-    output = actual(input_ids=ids, attention_mask=mask, use_cache=False)
+    inputs = (
+        {"input_ids": ids} if input_kind == "ids" else {"inputs_embeds": embedding(ids)}
+    )
+    expected = getattr(
+        reference(**inputs, attention_mask=mask, use_cache=False), output_field
+    )
+    output = actual(**inputs, attention_mask=mask, use_cache=False)
     assert_fp32_close(getattr(output, output_field, output), expected)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("selection", ["all", "last", "indices"])
+def test_lm_head_selection_fp32(selection: str, config: InklingConfig) -> None:
+    config.text_config.unpadded_vocab_size = 29
+    actual, reference = pair(
+        inkling.MyInkling(config),
+        hf.InklingForConditionalGeneration(config),
+        ignored_prefixes=("model.audio_tower.", "model.vision_tower."),
+    )
+    ids, mask = tokens_and_mask()
+    logits_to_keep = (
+        torch.tensor([0, 3, 6])
+        if selection == "indices"
+        else 2
+        if selection == "last"
+        else 0
+    )
+    inputs = {
+        "input_ids": ids,
+        "attention_mask": mask,
+        "use_cache": False,
+        "logits_to_keep": logits_to_keep,
+    }
+    expected = reference(**inputs).logits
+    assert_fp32_close(actual(**inputs), expected)

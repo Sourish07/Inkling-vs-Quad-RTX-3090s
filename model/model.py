@@ -47,6 +47,8 @@ class InklingTextConfig:
 
     log_scaling_n_floor: int | None = None
     log_scaling_alpha: float = 0.1
+    logits_mup_width_multiplier: float = 24.0
+    unpadded_vocab_size: int | None = None
 
     def __post_init__(self) -> None:
         if self.layer_types is None:
@@ -761,13 +763,84 @@ class MyInklingModel(nn.Module):
         self.audio_tower = None
         self.vision_tower = MyInklingVisionTower(config)
 
+    def forward(
+        self,
+        input_ids: Int[T, "bs s"] | None = None,
+        attention_mask: (
+            Bool[T, "bs s"]
+            | Int[T, "bs s"]
+            | Fp[T, "#bs 1 s s"]
+            | dict[str, T | None]
+            | None
+        ) = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: Fp[T, "bs s d"] | None = None,
+        use_cache: bool = False,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> Fp[T, "bs s d"]:
+        if (
+            kwargs.get("pixel_values") is not None
+            or kwargs.get("audio_input_ids") is not None
+        ):
+            raise NotImplementedError("Vision and audio inputs are not implemented yet.")
+        return self.language_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            **kwargs,
+        )
+
 
 class MyInkling(nn.Module):
     def __init__(self, config: InklingConfig):
         super().__init__()
+        self.config = config
         self.model = MyInklingModel(config)
         self.lm_head = nn.Linear(
             config.text_config.hidden_size, config.text_config.vocab_size, bias=False
         )
 
         self.mtp = None  # TODO: add MTP support
+
+    def forward(
+        self,
+        input_ids: Int[T, "bs s"] | None = None,
+        attention_mask: (
+            Bool[T, "bs s"]
+            | Int[T, "bs s"]
+            | Fp[T, "#bs 1 s s"]
+            | dict[str, T | None]
+            | None
+        ) = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: Fp[T, "bs s d"] | None = None,
+        use_cache: bool = False,
+        logits_to_keep: int | Int[T, " s_out"] = 0,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> Fp[T, "bs s_out vocab"]:
+        hidden_states = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            **kwargs,
+        )
+        hidden_states = (
+            hidden_states / self.config.text_config.logits_mup_width_multiplier
+        )
+        if isinstance(logits_to_keep, int):
+            if logits_to_keep < 0:
+                raise ValueError("logits_to_keep must be non-negative.")
+            selected_positions = slice(-logits_to_keep, None)
+        else:
+            selected_positions = logits_to_keep
+        logits: Fp[T, "bs s_out vocab"] = self.lm_head(
+            hidden_states[:, selected_positions, :]
+        )
+        unpadded_vocab_size = self.config.text_config.unpadded_vocab_size
+        if unpadded_vocab_size is not None:
+            logits = logits[..., :unpadded_vocab_size]
+        return logits
