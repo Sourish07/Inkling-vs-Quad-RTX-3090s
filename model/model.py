@@ -1,9 +1,10 @@
 from dataclasses import dataclass
 
 import torch
-from einops import rearrange
-from jaxtyping import Bool, Float
-from torch import nn
+from einops import rearrange, repeat
+from jaxtyping import Bool, Float, Int
+from torch import Tensor, nn
+from torch import Tensor as T
 from transformers import AutoProcessor, InklingForConditionalGeneration
 
 ACT2FN = {"silu": nn.functional.silu}
@@ -62,12 +63,52 @@ class InklingConfig:
 
 
 class MyInklingRelativeLogits(nn.Module):
+    """
+    TODO: Double check these comments
+
+    No RoPE in this model; All positional embeddings are relative.
+
+    Parameters:
+        d_rel: Number of learned distance patterns, i.e. one may prioritize closer tokens, etc.
+        rel_extent: How many backwards tokens are covered
+    """
+
     def __init__(self, d_rel: int, rel_extent: int):
         super().__init__()
         self.d_rel = d_rel
         self.rel_extent = rel_extent
 
         self.proj = nn.Parameter(torch.empty(d_rel, rel_extent))
+
+    def forward(
+        self,
+        relative_states: Float[T, "bs q_len num_heads d_rel"],
+        query_positions: Int[T, " q_len"],
+        key_positions: Int[T, " k_len"],
+    ) -> Float[T, "bs num_heads q_len k_len"]:
+        rel_logits = rearrange(
+            relative_states @ self.proj,
+            "bs q_len num_heads rel_extent -> bs num_heads q_len rel_extent",
+        )
+
+        distance: Int[T, "q_len k_len"] = rearrange(
+            query_positions, "q_len -> q_len 1"
+        ) - rearrange(key_positions, "k_len -> 1 k_len")
+
+        gather_index = repeat(
+            distance.clamp(0, self.rel_extent - 1),
+            "q_len k_len -> bs num_heads q_len k_len",
+            bs=rel_logits.shape[0],
+            num_heads=rel_logits.shape[1],
+        )
+
+        position_bias: Float[T, "bs num_heads q_len k_len"] = rel_logits.gather(
+            -1, gather_index
+        )
+
+        return position_bias.masked_fill(
+            (distance < 0) | (distance >= self.rel_extent), 0.0
+        )
 
 
 class MyInklingRMSNorm(nn.Module):
