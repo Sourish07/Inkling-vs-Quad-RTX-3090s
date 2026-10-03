@@ -442,6 +442,10 @@ class MyInklingNormedEmbedding(nn.Embedding):
         super().__init__(num_embeddings, embedding_dim, padding_idx)
         self.embed_norm = MyInklingRMSNorm(embedding_dim, eps=norm_eps)
 
+    def forward(self, input_ids: Int[T, "bs s"]) -> Fp[T, "bs s d"]:
+        embeddings = super().forward(input_ids)
+        return self.embed_norm(embeddings)
+
 
 class MyInklingDecoderLayer(nn.Module):
     def __init__(self, config: InklingTextConfig, layer_idx: int):
