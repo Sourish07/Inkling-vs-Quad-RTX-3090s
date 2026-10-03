@@ -1,4 +1,4 @@
-"""Compare MyInkling's meta state dictionary with BF16 checkpoint headers."""
+"""Compare MyInkling's text parameters with BF16 checkpoint headers."""
 
 from concurrent.futures import ThreadPoolExecutor
 
@@ -53,12 +53,19 @@ def convert_checkpoint_shapes(
 
 def test_checkpoint_state_dict() -> None:
     repo_id = "thinkingmachines/Inkling-Small"
+    ignored_prefixes = (
+        "model.audio_tower.",
+        "model.vision_tower.",
+        "model.mtp.",
+        "mtp.",
+    )
     api = HfApi()
     info = api.model_info(repo_id)
     files = sorted(
         file.rfilename
         for file in info.siblings
         if file.rfilename.endswith(".safetensors")
+        and file.rfilename != "mtp.safetensors"
     )
     assert files, f"No safetensors files found in {repo_id}"
 
@@ -73,13 +80,24 @@ def test_checkpoint_state_dict() -> None:
                 assert key not in checkpoint_shapes, f"Duplicate checkpoint key: {key}"
                 checkpoint_shapes[key] = tuple(tensor.shape)
     checkpoint_shapes = convert_checkpoint_shapes(checkpoint_shapes)
+    checkpoint_shapes = {
+        key: shape
+        for key, shape in checkpoint_shapes.items()
+        if not key.startswith(ignored_prefixes)
+    }
 
     config = AutoConfig.from_pretrained(repo_id, revision=info.sha)
+    # Small's legacy config loses the expert size during dense-size conversion.
+    config.text_config.moe_intermediate_size = 2048
     with torch.device("meta"):
         model = MyInkling(config)
     state_dict = model.state_dict()
     assert all(tensor.is_meta for tensor in state_dict.values())
-    model_shapes = {key: tuple(tensor.shape) for key, tensor in state_dict.items()}
+    model_shapes = {
+        key: tuple(tensor.shape)
+        for key, tensor in state_dict.items()
+        if not key.startswith(ignored_prefixes)
+    }
     mismatches = [
         f"{key}: model={model_shapes.get(key, '<missing>')}, "
         f"checkpoint={checkpoint_shapes.get(key, '<missing>')}"
@@ -87,9 +105,17 @@ def test_checkpoint_state_dict() -> None:
         if model_shapes.get(key) != checkpoint_shapes.get(key)
     ]
     if mismatches:
+        missing_from_model = len(checkpoint_shapes.keys() - model_shapes.keys())
+        missing_from_checkpoint = len(model_shapes.keys() - checkpoint_shapes.keys())
+        shape_mismatches = (
+            len(mismatches) - missing_from_model - missing_from_checkpoint
+        )
         # Keep details in captured stdout so pytest's summary cannot repeat them.
         print("\n".join(mismatches))
         pytest.fail(
-            f"{len(mismatches)} state-dictionary keys differ; see output above.",
+            f"{len(mismatches)} keys remain unmatched: "
+            f"{missing_from_model} missing from model, "
+            f"{missing_from_checkpoint} missing from checkpoint, "
+            f"{shape_mismatches} shape mismatches; see output above.",
             pytrace=False,
         )
