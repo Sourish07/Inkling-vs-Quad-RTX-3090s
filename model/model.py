@@ -336,6 +336,21 @@ class MyInklingMoE(nn.Module):
         self.experts = MyInklingExperts(config)
         self.shared_experts = MyInklingSharedExperts(config)
 
+    def forward(self, hidden_states: Fp[T, "bs s d"]) -> Fp[T, "bs s d"]:
+        input_shape = hidden_states.shape
+        residuals = hidden_states
+
+        _, topk_weights, topk_indices, shared_gammas = self.gate(hidden_states)
+
+        hidden_states = rearrange(hidden_states, "bs s d -> (bs s) d")
+        hidden_states = self.experts(hidden_states, topk_indices, topk_weights).view(
+            *input_shape
+        )
+        hidden_states = hidden_states + self.shared_experts(
+            residuals, gammas=shared_gammas
+        )
+        return hidden_states
+
 
 class MyInklingShortConv(nn.Module):
     """
