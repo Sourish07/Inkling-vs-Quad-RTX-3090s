@@ -33,3 +33,4 @@ pythonpath = ["."]
 [tool.ty.rules]
 all = "ignore"
 unresolved-import = "error"
+unresolved-attribute = "error"
