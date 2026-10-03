@@ -3,9 +3,14 @@ from dataclasses import dataclass
 import torch
 from einops import rearrange, repeat
 from jaxtyping import Bool, Float, Int
-from torch import Tensor, nn
+from jaxtyping import Float as Fp
 from torch import Tensor as T
+from torch import nn
+from torch.nn import functional as F
 from transformers import AutoProcessor, InklingForConditionalGeneration
+from transformers.models.cvt.convert_cvt_original_pytorch_checkpoint_to_pytorch import (
+    final,
+)
 
 ACT2FN = {"silu": nn.functional.silu}
 
@@ -220,6 +225,51 @@ class MyInklingExperts(nn.Module):
             torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim)
         )
         self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(
+        self,
+        hidden_states: Fp[T, "t d"],
+        top_k_index: Int[T, "t k"],
+        top_k_weights: Fp[T, "t k"],
+    ) -> Fp[T, "t d"]:
+        """t = flattened tokens, d = hidden_size, k = experts per token."""
+        final_hidden_states = torch.zeros_like(hidden_states)
+
+        expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts + 1)
+        expert_mask: Int[T, "e k t"] = rearrange(expert_mask, "t k e -> e k t")
+
+        _expert_hit: Int[T, " e"] = expert_mask.sum(dim=(-1, -2))
+        expert_hit: Int[T, " e"] = torch.greater(_expert_hit, 0).nonzero().squeeze()
+
+        for expert_idx in expert_hit:
+            if expert_idx == self.num_experts:
+                continue
+
+            # expert_mask[expert_idx]: Bool[Tensor, "k t"]
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            # tok_k_pos and token_idx: Int[T, "num_tok_routed_to_expert"]
+
+            # current_state: Float[T, "num_tok_routed_to_expert d"]
+            current_state = hidden_states[token_idx]
+
+            gate, up = F.linear(
+                current_state,
+                self.gate_up_proj[expert_idx],
+            ).chunk(2, dim=-1)
+
+            current_hidden_states = self.act_fn(gate) * up
+            current_hidden_states = F.linear(
+                current_hidden_states,
+                self.down_proj[expert_idx],
+            )
+
+            current_hidden_states *= top_k_weights[token_idx, top_k_pos, None]
+
+            final_hidden_states.index_add_(
+                0, token_idx, current_hidden_states.to(final_hidden_states.dtype)
+            )
+
+        return final_hidden_states
 
 
 class MyInklingTopkRouter(nn.Module):
