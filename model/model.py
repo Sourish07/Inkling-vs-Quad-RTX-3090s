@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Unpack
 
 import torch
 from einops import rearrange, repeat
@@ -8,6 +9,8 @@ from torch import Tensor as T
 from torch import nn
 from torch.nn import functional as F
 from transformers import AutoProcessor, InklingForConditionalGeneration
+from transformers.cache_utils import Cache  # TODO: remove import
+from transformers.utils import TransformersKwargs  # TODO: remove import
 
 ACT2FN = {"silu": nn.functional.silu}
 
@@ -374,6 +377,32 @@ class MyInklingShortConv(nn.Module):
             padding=conv_kernel_size - 1,
             bias=False,
         )
+
+    def forward(
+        self,
+        hidden_states: Fp[T, "bs s d"],
+        past_key_values: Cache | None = None,
+        conv_mask: Bool[T, "bs s"] | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> Fp[T, "bs s d"]:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.float()
+
+        residual = hidden_states
+
+        # apply_mask_to_padding_states
+        if conv_mask is not None:
+            hidden_states = (hidden_states * conv_mask.unsqueeze(-1)).to(
+                hidden_states.dtype
+            )
+
+        seq_len = hidden_states.shape[1]
+        hidden_states = rearrange(hidden_states, "bs s d -> bs d s")
+
+        hidden_states = self.conv1d(hidden_states)[..., :seq_len]
+
+        hidden_states = rearrange(hidden_states, "bs d s -> bs s d")
+        return (hidden_states + residual).to(input_dtype)
 
 
 class MyInklingAttention(nn.Module):
