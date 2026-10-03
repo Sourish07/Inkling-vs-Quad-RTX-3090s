@@ -92,11 +92,11 @@ def config(text_config: InklingTextConfig) -> InklingConfig:
     )
 
 
-def pair(
-    actual: nn.Module,
-    reference: nn.Module,
+def pair[ActualModule: nn.Module, ReferenceModule: nn.Module](
+    actual: ActualModule,
+    reference: ReferenceModule,
     ignored_prefixes: tuple[str, ...] = (),
-) -> tuple[nn.Module, nn.Module]:
+) -> tuple[ActualModule, ReferenceModule]:
     """Initialize even torch.empty expert tensors, then copy identical weights."""
     actual = actual.to(device="cpu", dtype=torch.float32).eval()
     reference = reference.to(device="cpu", dtype=torch.float32).eval()
@@ -387,12 +387,14 @@ def test_text_tower_prepared_masks_fp32(
 @torch.no_grad()
 @pytest.mark.skip(reason="Vision tower is not implemented yet.")
 def test_vision_tower_fp32(config: InklingConfig) -> None:
+    vision_config = config.vision_config
+    assert isinstance(vision_config, InklingVisionConfig)
     actual, reference = pair(
         inkling.MyInklingVisionTower(config),
-        hf.InklingVisionModel(config.vision_config),
+        hf.InklingVisionModel(vision_config),
     )
     # Transformers consumes channels-last spatiotemporal patches.
-    pixels = torch.randn(2, 2, 2, 2, config.vision_config.num_channels)
+    pixels = torch.randn(2, 2, 2, 2, vision_config.num_channels)
     expected = reference(pixel_values=pixels).last_hidden_state
     output = actual(pixel_values=pixels)
     assert_fp32_close(getattr(output, "last_hidden_state", output), expected)
@@ -407,22 +409,19 @@ def test_model_fp32(with_lm_head: bool, input_kind: str, config: InklingConfig) 
     if with_lm_head:
         actual = inkling.MyInkling(config)
         reference = hf.InklingForConditionalGeneration(config)
+        embedding = reference.model.language_model.embed_tokens
         ignored = ("model.audio_tower.", "model.vision_tower.")
         output_field = "logits"
     else:
         actual = inkling.MyInklingModel(config)
         reference = hf.InklingModel(config)
+        embedding = reference.language_model.embed_tokens
         ignored = ("audio_tower.", "vision_tower.")
         output_field = "last_hidden_state"
     # Text-only inputs do not use audio/vision weights. Vision has its own test;
     # model.py does not yet define an audio module.
     actual, reference = pair(actual, reference, ignored_prefixes=ignored)
     ids, mask = tokens_and_mask()
-    embedding = (
-        reference.model.language_model.embed_tokens
-        if with_lm_head
-        else reference.language_model.embed_tokens
-    )
     inputs = (
         {"input_ids": ids} if input_kind == "ids" else {"inputs_embeds": embedding(ids)}
     )
