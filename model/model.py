@@ -6,6 +6,8 @@ from jaxtyping import Bool, Float
 from torch import nn
 from transformers import AutoProcessor, InklingForConditionalGeneration
 
+ACT2FN = {"silu": nn.functional.silu}
+
 
 @dataclass
 class InklingTextConfig:
@@ -30,6 +32,8 @@ class MyInklingRelativeLogits(nn.Module):
         self.d_rel = d_rel
         self.rel_extent = rel_extent
 
+        self.proj = nn.Parameter(torch.empty(d_rel, rel_extent))
+
 
 class MyInklingRMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
@@ -37,15 +41,85 @@ class MyInklingRMSNorm(nn.Module):
         self.hidden_size = hidden_size
         self.eps = eps
 
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+
 
 class MyInklingMLP(nn.Module):
     def __init__(self, config: InklingTextConfig):
         super().__init__()
 
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+
+        self.act_fn = ACT2FN[config.hidden_act]
+        self.global_scale = nn.Parameter(torch.ones(1))
+
+
+class MyInklingSharedExperts(nn.Module):
+    def __init__(self, config: InklingTextConfig):
+        super().__init__()
+
+        self.n_shared_experts = config.n_shared_experts
+        intermediate_dim = config.moe_intermediate_size
+
+        self.gate_proj = nn.Parameter(
+            torch.empty(config.n_shared_experts, intermediate_dim, config.hidden_size)
+        )
+        self.up_proj = nn.Parameter(
+            torch.empty(config.n_shared_experts, intermediate_dim, config.hidden_size)
+        )
+        self.down_proj = nn.Parameter(
+            torch.empty(config.n_shared_experts, config.hidden_size, intermediate_dim)
+        )
+        self.act_fn = ACT2FN[config.hidden_act]
+
+
+class MyInklingExperts(nn.Module):
+    def __init__(self, config: InklingTextConfig):
+        super().__init__()
+
+        self.num_experts = config.n_routed_experts
+        self.hidden_dim = config.hidden_size
+        self.intermediate_dim = config.moe_intermediate_size
+        self.gate_up_proj = nn.Parameter(
+            torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim)
+        )
+        self.down_proj = nn.Parameter(
+            torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim)
+        )
+        self.act_fn = ACT2FN[config.hidden_act]
+
+
+class MyInklingTopkRouter(nn.Module):
+    def __init__(self, config: InklingTextConfig):
+        super().__init__()
+
+        self.num_experts = config.n_routed_experts
+        self.n_shared_experts = config.n_shared_experts
+        self.n_total_experts = self.num_experts + self.n_shared_experts
+        self.hidden_dim = config.hidden_size
+        self.route_scale = config.route_scale
+        self.top_k = config.num_experts_per_tok
+
+        self.weight = nn.Parameter(
+            torch.empty(self.n_total_experts, config.hidden_size)
+        )
+        self.global_scale = nn.Parameter(torch.ones(1))
+        self.e_score_correction_bias = nn.Buffer(torch.zeros(self.num_experts))
+
 
 class MyInklingMoE(nn.Module):
     def __init__(self, config: InklingTextConfig):
         super().__init__()
+
+        self.gate = MyInklingTopkRouter(config)
+        self.experts = MyInklingExperts(config)
+        self.shared_experts = MyInklingSharedExperts(config)
 
 
 class MyInklingShortConv(nn.Module):
@@ -108,7 +182,9 @@ class MyInklingAttention(nn.Module):
         self.r_proj = nn.Linear(
             config.hidden_size, self.num_heads * config.d_rel, bias=False
         )
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size)
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, config.hidden_size, bias=False
+        )
 
         self.k_sconv = MyInklingShortConv(
             self.num_key_value_heads * self.head_dim,
@@ -129,13 +205,12 @@ class MyInklingAttention(nn.Module):
         self.rel_logits_proj = MyInklingRelativeLogits(config.d_rel, self.rel_extent)
 
 
-class MyInklingNormedEmbedding(nn.Module):
-    def __init__(self, vocab_size: int, hidden_size: int, padding_idx: int, eps: float):
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.hidden_size = hidden_size
-        self.padding_idx = padding_idx
-        self.eps = eps
+class MyInklingNormedEmbedding(nn.Embedding):
+    def __init__(
+        self, num_embeddings: int, embedding_dim: int, padding_idx: int, norm_eps: float
+    ):
+        super().__init__(num_embeddings, embedding_dim, padding_idx)
+        self.embed_norm = MyInklingRMSNorm(embedding_dim, eps=norm_eps)
 
 
 class MyInklingDecoderLayer(nn.Module):
@@ -147,11 +222,21 @@ class MyInklingDecoderLayer(nn.Module):
         self.self_attn = MyInklingAttention(config, layer_idx)
 
         if config.mlp_layer_types[layer_idx] == "sparse":
-            self.mlp = MyInklingMLP(config)
-        else:
             self.mlp = MyInklingMoE(config)
+        else:
+            self.mlp = MyInklingMLP(config)
 
-        self.input_layernorm = MyInklingRMSNorm(config)
+        self.input_layernorm = MyInklingRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = MyInklingRMSNorm(
+            config.hidden_size, config.rms_norm_eps
+        )
+        self.layer_type = config.layer_types[layer_idx]
+        self.attn_sconv = MyInklingShortConv(
+            config.hidden_size, config.conv_kernel_size, layer_idx=layer_idx, conv_idx=2
+        )
+        self.mlp_sconv = MyInklingShortConv(
+            config.hidden_size, config.conv_kernel_size, layer_idx=layer_idx, conv_idx=3
+        )
 
 
 class MyInklingTextTower(nn.Module):
