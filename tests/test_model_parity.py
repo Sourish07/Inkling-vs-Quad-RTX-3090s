@@ -291,12 +291,10 @@ def test_attention_fp32(layer_idx: int, text_config: InklingTextConfig) -> None:
     states = hidden_states(text_config)
     mask = attention_mask(text_config, layer_idx)
     _, conv_mask = tokens_and_mask()
-    expected, expected_weights = reference(
-        states, attention_mask=mask, conv_mask=conv_mask
-    )
+    expected, _ = reference(states, attention_mask=mask, conv_mask=conv_mask)
     output, weights = actual(states, attention_mask=mask, conv_mask=conv_mask)
     assert_fp32_close(output, expected)
-    assert_fp32_close(weights, expected_weights)
+    assert weights is None
 
 
 @torch.no_grad()

@@ -45,6 +45,9 @@ class InklingTextConfig:
     attention_dropout: float = 0.0
     conv_kernel_size: int = 4
 
+    log_scaling_n_floor: int | None = None
+    log_scaling_alpha: float = 0.1
+
     def __post_init__(self) -> None:
         if self.layer_types is None:
             self.layer_types = [
@@ -428,6 +431,9 @@ class MyInklingAttention(nn.Module):
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
 
+        self.log_scaling_n_floor = config.log_scaling_n_floor
+        self.log_scaling_alpha = config.log_scaling_alpha
+
         self.q_proj = nn.Linear(
             config.hidden_size, self.num_heads * self.head_dim, bias=False
         )
@@ -462,6 +468,106 @@ class MyInklingAttention(nn.Module):
         self.k_norm = MyInklingRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         self.rel_logits_proj = MyInklingRelativeLogits(config.d_rel, self.rel_extent)
+
+    def forward(
+        self,
+        hidden_states: Fp[T, "bs s d"],
+        attention_mask: Fp[T, "#bs 1 s k_len"] | None,
+        conv_mask: Bool[T, "bs s"] | None = None,
+        past_key_values: Cache | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> tuple[Fp[T, "bs s d"], None]:
+        """Return SDPA output without materializing attention probabilities."""
+        if past_key_values is not None:
+            raise NotImplementedError(
+                "Cached attention requires convolution-state support in MyInklingShortConv."
+            )
+
+        _q_proj = self.q_proj(hidden_states)
+        q_proj = rearrange(
+            _q_proj, "bs s (h c) -> bs h s c", h=self.num_heads, c=self.head_dim
+        )
+        query_states: Fp[T, "bs h s c"] = self.q_norm(q_proj)
+
+        key_projection: Fp[T, "bs s hk_c"] = self.k_sconv(
+            self.k_proj(hidden_states),
+            conv_mask=conv_mask,
+        )
+        value_projection: Fp[T, "bs s hk_c"] = self.v_sconv(
+            self.v_proj(hidden_states),
+            conv_mask=conv_mask,
+        )
+
+        _key_states = rearrange(
+            key_projection,
+            "bs s (hk c) -> bs hk s c",
+            hk=self.num_key_value_heads,
+            c=self.head_dim,
+        )
+        key_states: Fp[T, "bs hk k_len c"] = self.k_norm(_key_states)
+        value_states: Fp[T, "bs hk k_len c"] = rearrange(
+            value_projection,
+            "bs s (hk c) -> bs hk s c",
+            hk=self.num_key_value_heads,
+            c=self.head_dim,
+        )
+        relative_states: Fp[T, "bs s h r"] = rearrange(
+            self.r_proj(hidden_states),
+            "bs s (h r) -> bs s h r",
+            h=self.num_heads,
+        )
+
+        q_positions: Int[T, " s"] = torch.arange(
+            query_states.shape[2], device=hidden_states.device
+        )
+        kv_positions: Int[T, " k_len"] = torch.arange(
+            key_states.shape[2], device=hidden_states.device
+        )
+        position_bias: Fp[T, "bs h s k_len"] = self.rel_logits_proj(
+            relative_states, q_positions, kv_positions
+        )
+
+        # Inkling scales both content scores and relative bias in full attention.
+        if not self.is_sliding and self.log_scaling_n_floor is not None:
+            effective_n: Fp[T, " s"] = (q_positions + 1).float()
+
+            _tau = 1.0 + self.log_scaling_alpha * torch.log(
+                (effective_n / self.log_scaling_n_floor).clamp(min=1.0)
+            )
+            tau: Fp[T, "1 1 s 1"] = rearrange(_tau, "s -> 1 1 s 1")
+
+            query_states = (query_states.float() * tau).to(query_states.dtype)
+            position_bias = (position_bias.float() * tau).to(position_bias.dtype)
+
+        # SDPA receives relative bias through its floating-point additive mask.
+        # A supplied mask already encodes causality, sliding windows and padding.
+        sdpa_mask: Fp[T, "bs h s k_len"] = position_bias
+        if attention_mask is not None:
+            sdpa_mask = sdpa_mask + attention_mask.to(query_states.dtype)
+        else:
+            distance: Int[T, "s k_len"] = rearrange(
+                q_positions, "s -> s 1"
+            ) - rearrange(kv_positions, "k_len -> 1 k_len")
+            allowed: Bool[T, "s k_len"] = distance >= 0
+            if self.sliding_window is not None:
+                allowed = allowed & (distance < self.sliding_window)
+            sdpa_mask = sdpa_mask.masked_fill(~allowed, float("-inf"))
+
+        attn_output: Fp[T, "bs h s c"] = F.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=sdpa_mask,
+            dropout_p=self.attention_dropout,
+            is_causal=False,
+            scale=self.scaling,
+            enable_gqa=self.num_key_value_groups > 1,
+        )
+
+        output: Fp[T, "bs s d"] = self.o_proj(
+            rearrange(attn_output, "bs h s c -> bs s (h c)").contiguous()
+        )
+        return output, None
 
 
 class MyInklingNormedEmbedding(nn.Embedding):
