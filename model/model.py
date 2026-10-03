@@ -642,6 +642,7 @@ class MyInklingDecoderLayer(nn.Module):
 class MyInklingTextTower(nn.Module):
     def __init__(self, config: InklingTextConfig):
         super().__init__()
+        self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
@@ -655,6 +656,96 @@ class MyInklingTextTower(nn.Module):
             ]
         )
         self.norm = MyInklingRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        input_ids: Int[T, "bs s"] | None = None,
+        attention_mask: (
+            Bool[T, "bs s"]
+            | Int[T, "bs s"]
+            | Fp[T, "#bs 1 s s"]
+            | dict[str, T | None]
+            | None
+        ) = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: Fp[T, "bs s d"] | None = None,
+        use_cache: bool = False,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> Fp[T, "bs s d"]:
+        """Embed tokens, apply causal decoder layers, and normalize hidden states."""
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("Specify exactly one of input_ids or inputs_embeds.")
+        if use_cache or past_key_values is not None:
+            raise NotImplementedError(
+                "Cached decoding requires convolution-state support; use use_cache=False."
+            )
+
+        hidden_states: Fp[T, "bs s d"] = (
+            self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
+        )
+        seq_len = hidden_states.shape[1]
+
+        if isinstance(attention_mask, dict):
+            masks = attention_mask
+        elif attention_mask is not None and attention_mask.ndim == 4:
+            # Prepared additive masks already encode their attention constraints.
+            masks = {
+                "full_attention": attention_mask,
+                "sliding_attention": attention_mask,
+                "linear_attention": None,
+            }
+        else:
+            positions: Int[T, " s"] = torch.arange(
+                seq_len, device=hidden_states.device
+            )
+            distance: Int[T, "s s"] = rearrange(
+                positions, "s -> s 1"
+            ) - rearrange(positions, "s -> 1 s")
+            allowed: Bool[T, "#bs 1 s s"] = rearrange(
+                distance >= 0, "q k -> 1 1 q k"
+            )
+            padding_mask: Bool[T, "bs s"] | None = None
+            if attention_mask is not None:
+                if attention_mask.shape != hidden_states.shape[:2]:
+                    raise ValueError("The padding mask must have shape [bs, s].")
+                padding_mask = attention_mask.to(
+                    device=hidden_states.device, dtype=torch.bool
+                )
+                allowed = allowed & rearrange(
+                    padding_mask, "bs s -> bs 1 1 s"
+                )
+
+            mask_values = hidden_states.new_zeros(allowed.shape)
+            masked_value = torch.finfo(hidden_states.dtype).min
+            full_mask: Fp[T, "#bs 1 s s"] = mask_values.masked_fill(
+                ~allowed, masked_value
+            )
+            sliding_allowed = allowed & (
+                distance < self.config.sliding_window_size
+            )
+            sliding_mask: Fp[T, "#bs 1 s s"] = mask_values.masked_fill(
+                ~sliding_allowed, masked_value
+            )
+            masks = {
+                "full_attention": full_mask,
+                "sliding_attention": sliding_mask,
+                # Match the reference's single-token convolution-mask behavior.
+                "linear_attention": padding_mask if seq_len > 1 else None,
+            }
+
+        for layer in self.layers:
+            attention_type = (
+                "sliding_attention"
+                if layer.layer_type == "hybrid_sliding"
+                else "full_attention"
+            )
+            hidden_states = layer(
+                hidden_states,
+                attention_mask=masks[attention_type],
+                conv_mask=masks["linear_attention"],
+                **kwargs,
+            )
+        return self.norm(hidden_states)
 
 
 class MyInklingVisionTower(nn.Module):

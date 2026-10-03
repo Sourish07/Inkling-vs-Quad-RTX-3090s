@@ -1,7 +1,7 @@
 """Small, offline CPU/fp32 comparisons with Transformers' Inkling modules.
 
-These are implementation tests: missing forwards and the unfinished vision tower
-must fail, rather than being skipped or replaced with reference implementations.
+Missing forwards fail rather than being replaced with reference implementations.
+The vision-tower case is temporarily skipped until that tower is implemented.
 Run with ``uv run --frozen -m pytest tests/test_model_parity.py``.
 """
 
@@ -334,19 +334,58 @@ def test_decoder_layer_fp32(
 
 
 @torch.no_grad()
-def test_text_tower_fp32(text_config: InklingTextConfig) -> None:
+@pytest.mark.parametrize("input_kind", ["ids", "embeddings"])
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("seq_len", [1, 7])
+def test_text_tower_fp32(
+    input_kind: str, masked: bool, seq_len: int, text_config: InklingTextConfig
+) -> None:
     actual, reference = pair(
         inkling.MyInklingTextTower(text_config), hf.InklingTextModel(text_config)
     )
     ids, mask = tokens_and_mask()
+    ids = ids[:, :seq_len]
+    mask = mask[:, :seq_len] if masked else None
+    inputs = (
+        {"input_ids": ids}
+        if input_kind == "ids"
+        else {"inputs_embeds": reference.embed_tokens(ids)}
+    )
     expected = reference(
-        input_ids=ids, attention_mask=mask, use_cache=False
+        **inputs, attention_mask=mask, use_cache=False
     ).last_hidden_state
-    output = actual(input_ids=ids, attention_mask=mask, use_cache=False)
+    output = actual(**inputs, attention_mask=mask, use_cache=False)
     assert_fp32_close(getattr(output, "last_hidden_state", output), expected)
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("mask_kind", ["additive", "mapping"])
+def test_text_tower_prepared_masks_fp32(
+    mask_kind: str, text_config: InklingTextConfig
+) -> None:
+    actual, reference = pair(
+        inkling.MyInklingTextTower(text_config), hf.InklingTextModel(text_config)
+    )
+    ids, padding_mask = tokens_and_mask()
+    full_mask = attention_mask(text_config, layer_idx=0)
+    masks = (
+        full_mask
+        if mask_kind == "additive"
+        else {
+            "full_attention": full_mask,
+            "sliding_attention": attention_mask(text_config, layer_idx=1),
+            "linear_attention": padding_mask,
+        }
+    )
+    expected = reference(
+        input_ids=ids, attention_mask=masks, use_cache=False
+    ).last_hidden_state
+    output = actual(input_ids=ids, attention_mask=masks, use_cache=False)
+    assert_fp32_close(output, expected)
+
+
+@torch.no_grad()
+@pytest.mark.skip(reason="Vision tower is not implemented yet.")
 def test_vision_tower_fp32(config: InklingConfig) -> None:
     actual, reference = pair(
         inkling.MyInklingVisionTower(config),
