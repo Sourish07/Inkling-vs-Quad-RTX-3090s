@@ -1,6 +1,5 @@
 """Small, offline CPU/fp32 comparisons with Transformers' Inkling modules.
 
-Missing forwards fail rather than being replaced with reference implementations.
 The vision-tower case is temporarily skipped until that tower is implemented.
 Run with ``uv run --frozen -m pytest tests/test_model_parity.py``.
 """
