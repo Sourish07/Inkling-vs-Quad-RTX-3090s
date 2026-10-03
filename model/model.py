@@ -171,41 +171,38 @@ class MyInklingSharedExperts(nn.Module):
 
     def forward(
         self,
-        hidden_states: Float[T, "bs seq_len hidden_size"],
-        gammas: Float[T, "bs*seq_len n_shared"],
-    ) -> Float[T, "bs seq_len hidden_size"]:
+        hidden_states: Float[T, "bs s d"],
+        gammas: Float[T, "bs*s e"],
+    ) -> Float[T, "bs s d"]:
         """
-        tok = bs * seq_len
+        t = bs * s
         s = seq_len
-        d = intermediate dim
-        h = hidden_size
+        d = hidden_size
+        f = moe_intermediate_size
+        e = n_shared_experts
         """
         input_shape = hidden_states.shape
 
-        hidden_states: Float[T, "n_shared tok h"] = repeat(
+        hidden_states: Float[T, "e t d"] = repeat(
             hidden_states,
-            "bs s h -> n_shared (bs s) h",
-            n_shared=self.n_shared_experts,
+            "bs s d -> e (bs s) d",
+            e=self.n_shared_experts,
         )
 
-        gammas = rearrange(gammas, "tok n_shared -> n_shared tok 1")
+        gammas = rearrange(gammas, "t e -> e t 1")
 
-        gate = torch.bmm(
-            hidden_states,
-            rearrange(self.gate_proj, "n_shared d h -> n_shared h d"),
+        gate_proj, up_proj = (
+            rearrange(layer, "e f d -> e d f")
+            for layer in [self.gate_proj, self.up_proj]
         )
-        up = torch.bmm(
-            hidden_states,
-            rearrange(self.up_proj, "n_shared d h -> n_shared h d"),
-        )
+        gate = torch.bmm(hidden_states, gate_proj)
+        up = torch.bmm(hidden_states, up_proj)
+        activated: Float[T, "e t f"] = self.act_fn(gate) * up * gammas
 
-        activated: Float[T, "n_shared tok d"] = self.act_fn(gate) * up * gammas
+        down_proj = rearrange(self.down_proj, "e d f -> e f d")
+        down: Float[T, "e t d"] = torch.bmm(activated, down_proj)
 
-        down: Float[T, "n_shared tok h"] = torch.bmm(
-            activated,
-            rearrange(self.down_proj, "n_shared h d -> n_shared d h"),
-        )
-        out: Float[T, "tok h"] = down.float().sum(dim=0).to(hidden_states.dtype)
+        out: Float[T, "t d"] = down.float().sum(dim=0).to(hidden_states.dtype)
         return out.view(input_shape)
 
 
