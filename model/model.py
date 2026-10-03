@@ -3,7 +3,7 @@ from typing import Unpack
 
 import torch
 from einops import rearrange, repeat
-from jaxtyping import Bool, Float, Int
+from jaxtyping import Bool, Int
 from jaxtyping import Float as Fp
 from torch import Tensor as T
 from torch import nn
@@ -13,6 +13,25 @@ from transformers.cache_utils import Cache  # TODO: remove import
 from transformers.utils import TransformersKwargs  # TODO: remove import
 
 ACT2FN = {"silu": nn.functional.silu}
+
+"""
+Shape names:
+bs    = batch size
+s     = sequence/query length
+k_len = key length
+t     = flattened tokens (bs * s)
+d     = feature width; usually the model hidden size
+        (normalization/convolution helpers use their input feature width)
+h     = query heads
+hk    = key/value heads
+c     = head width
+r     = relative feature width
+f     = expert intermediate width
+e     = total experts
+e_r   = routed experts
+e_s   = shared experts
+k     = routed experts selected per token
+"""
 
 
 @dataclass
@@ -92,29 +111,27 @@ class MyInklingRelativeLogits(nn.Module):
 
     def forward(
         self,
-        relative_states: Float[T, "bs q_len num_heads d_rel"],
-        query_positions: Int[T, " q_len"],
+        relative_states: Fp[T, "bs s h r"],
+        query_positions: Int[T, " s"],
         key_positions: Int[T, " k_len"],
-    ) -> Float[T, "bs num_heads q_len k_len"]:
+    ) -> Fp[T, "bs h s k_len"]:
         rel_logits = rearrange(
             relative_states @ self.proj,
-            "bs q_len num_heads rel_extent -> bs num_heads q_len rel_extent",
+            "bs s h rel_extent -> bs h s rel_extent",
         )
 
-        distance: Int[T, "q_len k_len"] = rearrange(
-            query_positions, "q_len -> q_len 1"
+        distance: Int[T, "s k_len"] = rearrange(
+            query_positions, "s -> s 1"
         ) - rearrange(key_positions, "k_len -> 1 k_len")
 
         gather_index = repeat(
             distance.clamp(0, self.rel_extent - 1),
-            "q_len k_len -> bs num_heads q_len k_len",
+            "s k_len -> bs h s k_len",
             bs=rel_logits.shape[0],
-            num_heads=rel_logits.shape[1],
+            h=rel_logits.shape[1],
         )
 
-        position_bias: Float[T, "bs num_heads q_len k_len"] = rel_logits.gather(
-            -1, gather_index
-        )
+        position_bias: Fp[T, "bs h s k_len"] = rel_logits.gather(-1, gather_index)
 
         return position_bias.masked_fill(
             (distance < 0) | (distance >= self.rel_extent), 0.0
@@ -128,12 +145,10 @@ class MyInklingRMSNorm(nn.Module):
 
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
-    def forward(
-        self, hidden_states: Float[T, "... hidden_size"]
-    ) -> Float[T, "... hidden_size"]:
+    def forward(self, hidden_states: Fp[T, "*batch d"]) -> Fp[T, "*batch d"]:
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.float()
-        variance: Float[T, "... 1"] = hidden_states.pow(2).mean(-1, keepdim=True)
+        variance: Fp[T, "*batch 1"] = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
 
@@ -153,9 +168,7 @@ class MyInklingMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
         self.global_scale = nn.Parameter(torch.ones(1))
 
-    def forward(
-        self, hidden_states: Float[T, "bs seq_len hidden_size"]
-    ) -> Float[T, "bs seq_len hidden_size"]:
+    def forward(self, hidden_states: Fp[T, "bs s d"]) -> Fp[T, "bs s d"]:
         gate = self.act_fn(self.gate_proj(hidden_states))
         up = self.up_proj(hidden_states)
         return self.down_proj(gate * up) * self.global_scale
@@ -181,38 +194,38 @@ class MyInklingSharedExperts(nn.Module):
 
     def forward(
         self,
-        hidden_states: Float[T, "bs s d"],
-        gammas: Float[T, "bs*s e"],
-    ) -> Float[T, "bs s d"]:
+        hidden_states: Fp[T, "bs s d"],
+        gammas: Fp[T, "bs*s e_s"],
+    ) -> Fp[T, "bs s d"]:
         """
         t = bs * s
         s = seq_len
         d = hidden_size
         f = moe_intermediate_size
-        e = n_shared_experts
+        e_s = n_shared_experts
         """
         input_shape = hidden_states.shape
 
-        hidden_states: Float[T, "e t d"] = repeat(
+        hidden_states: Fp[T, "e_s t d"] = repeat(
             hidden_states,
-            "bs s d -> e (bs s) d",
-            e=self.n_shared_experts,
+            "bs s d -> e_s (bs s) d",
+            e_s=self.n_shared_experts,
         )
 
-        gammas = rearrange(gammas, "t e -> e t 1")
+        gammas = rearrange(gammas, "t e_s -> e_s t 1")
 
         gate_proj, up_proj = (
-            rearrange(layer, "e f d -> e d f")
+            rearrange(layer, "e_s f d -> e_s d f")
             for layer in [self.gate_proj, self.up_proj]
         )
         gate = torch.bmm(hidden_states, gate_proj)
         up = torch.bmm(hidden_states, up_proj)
-        activated: Float[T, "e t f"] = self.act_fn(gate) * up * gammas
+        activated: Fp[T, "e_s t f"] = self.act_fn(gate) * up * gammas
 
-        down_proj = rearrange(self.down_proj, "e d f -> e f d")
-        down: Float[T, "e t d"] = torch.bmm(activated, down_proj)
+        down_proj = rearrange(self.down_proj, "e_s d f -> e_s f d")
+        down: Fp[T, "e_s t d"] = torch.bmm(activated, down_proj)
 
-        out: Float[T, "t d"] = down.float().sum(dim=0).to(hidden_states.dtype)
+        out: Fp[T, "t d"] = down.float().sum(dim=0).to(hidden_states.dtype)
         return out.view(input_shape)
 
 
@@ -237,24 +250,28 @@ class MyInklingExperts(nn.Module):
         top_k_index: Int[T, "t k"],
         top_k_weights: Fp[T, "t k"],
     ) -> Fp[T, "t d"]:
-        """t = flattened tokens, d = hidden_size, k = experts per token."""
+        """e_slots includes routed experts plus one skipped sentinel slot."""
         final_hidden_states = torch.zeros_like(hidden_states)
 
         expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts + 1)
-        expert_mask: Int[T, "e k t"] = rearrange(expert_mask, "t k e -> e k t")
+        expert_mask: Int[T, "e_slots k t"] = rearrange(
+            expert_mask, "t k e_slots -> e_slots k t"
+        )
 
-        _expert_hit: Int[T, " e"] = expert_mask.sum(dim=(-1, -2))
-        expert_hit: Int[T, " e"] = torch.greater(_expert_hit, 0).nonzero().squeeze()
+        _expert_hit: Int[T, " e_slots"] = expert_mask.sum(dim=(-1, -2))
+        expert_hit: Int[T, " num_active_experts"] = (
+            torch.greater(_expert_hit, 0).nonzero().squeeze(-1)
+        )
 
         for expert_idx in expert_hit:
             if expert_idx == self.num_experts:
                 continue
 
-            # expert_mask[expert_idx]: Bool[Tensor, "k t"]
+            # expert_mask[expert_idx]: Int[T, "k t"]
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            # tok_k_pos and token_idx: Int[T, "num_tok_routed_to_expert"]
+            # top_k_pos and token_idx: Int[T, " num_tok_routed_to_expert"]
 
-            # current_state: Float[T, "num_tok_routed_to_expert d"]
+            # current_state: Fp[T, "num_tok_routed_to_expert d"]
             current_state = hidden_states[token_idx]
 
             gate, up = F.linear(
@@ -309,7 +326,7 @@ class MyInklingTopkRouter(nn.Module):
         e_s: shared experts
         """
         flat = rearrange(hidden_states, "bs s d -> (bs s) d")
-        router_logits: Fp[T, "t total_experts"] = F.linear(flat, self.weight)
+        router_logits: Fp[T, "t e"] = F.linear(flat, self.weight)
 
         scores = router_logits.sigmoid()
         routed_scores = scores[..., : -self.n_shared_experts]
@@ -697,15 +714,11 @@ class MyInklingTextTower(nn.Module):
                 "linear_attention": None,
             }
         else:
-            positions: Int[T, " s"] = torch.arange(
-                seq_len, device=hidden_states.device
+            positions: Int[T, " s"] = torch.arange(seq_len, device=hidden_states.device)
+            distance: Int[T, "s s"] = rearrange(positions, "s -> s 1") - rearrange(
+                positions, "s -> 1 s"
             )
-            distance: Int[T, "s s"] = rearrange(
-                positions, "s -> s 1"
-            ) - rearrange(positions, "s -> 1 s")
-            allowed: Bool[T, "#bs 1 s s"] = rearrange(
-                distance >= 0, "q k -> 1 1 q k"
-            )
+            allowed: Bool[T, "#bs 1 s s"] = rearrange(distance >= 0, "q k -> 1 1 q k")
             padding_mask: Bool[T, "bs s"] | None = None
             if attention_mask is not None:
                 if attention_mask.shape != hidden_states.shape[:2]:
@@ -713,18 +726,14 @@ class MyInklingTextTower(nn.Module):
                 padding_mask = attention_mask.to(
                     device=hidden_states.device, dtype=torch.bool
                 )
-                allowed = allowed & rearrange(
-                    padding_mask, "bs s -> bs 1 1 s"
-                )
+                allowed = allowed & rearrange(padding_mask, "bs s -> bs 1 1 s")
 
             mask_values = hidden_states.new_zeros(allowed.shape)
             masked_value = torch.finfo(hidden_states.dtype).min
             full_mask: Fp[T, "#bs 1 s s"] = mask_values.masked_fill(
                 ~allowed, masked_value
             )
-            sliding_allowed = allowed & (
-                distance < self.config.sliding_window_size
-            )
+            sliding_allowed = allowed & (distance < self.config.sliding_window_size)
             sliding_mask: Fp[T, "#bs 1 s s"] = mask_values.masked_fill(
                 ~sliding_allowed, masked_value
             )
@@ -782,7 +791,9 @@ class MyInklingModel(nn.Module):
             kwargs.get("pixel_values") is not None
             or kwargs.get("audio_input_ids") is not None
         ):
-            raise NotImplementedError("Vision and audio inputs are not implemented yet.")
+            raise NotImplementedError(
+                "Vision and audio inputs are not implemented yet."
+            )
         return self.language_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -837,10 +848,13 @@ class MyInkling(nn.Module):
             selected_positions = slice(-logits_to_keep, None)
         else:
             selected_positions = logits_to_keep
-        logits: Fp[T, "bs s_out vocab"] = self.lm_head(
+        padded_logits: Fp[T, "bs s_out padded_vocab"] = self.lm_head(
             hidden_states[:, selected_positions, :]
         )
         unpadded_vocab_size = self.config.text_config.unpadded_vocab_size
-        if unpadded_vocab_size is not None:
-            logits = logits[..., :unpadded_vocab_size]
+        logits: Fp[T, "bs s_out vocab"] = (
+            padded_logits[..., :unpadded_vocab_size]
+            if unpadded_vocab_size is not None
+            else padded_logits
+        )
         return logits
