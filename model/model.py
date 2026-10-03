@@ -16,7 +16,42 @@ class InklingTextConfig:
     num_hidden_layers: int
     pad_token_id: int
     rms_norm_eps: float = 1e-6
-    mlp_layer_types: list[str] = None
+    mlp_layer_types: list[str] | None = None
+    layer_types: list[str] | None = None
+
+    intermediate_size: int = 24576
+    hidden_act: str = "silu"
+    moe_intermediate_size: int = 3072
+    n_routed_experts: int = 256
+    num_experts_per_tok: int = 6
+    n_shared_experts: int = 2
+    route_scale: float = 8.0
+
+    num_attention_heads: int = 64
+    num_key_value_heads: int = 8
+    head_dim: int = 128
+    swa_num_attention_heads: int = 64
+    swa_num_key_value_heads: int = 16
+    swa_head_dim: int = 128
+    sliding_window_size: int = 512
+    d_rel: int = 16
+    rel_extent: int = 1024
+    attention_dropout: float = 0.0
+    conv_kernel_size: int = 4
+
+    def __post_init__(self) -> None:
+        if self.layer_types is None:
+            self.layer_types = [
+                "hybrid" if (i + 1) % 6 == 0 else "hybrid_sliding"
+                for i in range(self.num_hidden_layers)
+            ]
+        if self.mlp_layer_types is None:
+            self.mlp_layer_types = ["sparse"] * self.num_hidden_layers
+
+    @property
+    def sconv_kernel_size(self) -> int:
+        # Transformers aliases this checkpoint name to conv_kernel_size.
+        return self.conv_kernel_size
 
 
 @dataclass
