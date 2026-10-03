@@ -8,9 +8,6 @@ from torch import Tensor as T
 from torch import nn
 from torch.nn import functional as F
 from transformers import AutoProcessor, InklingForConditionalGeneration
-from transformers.models.cvt.convert_cvt_original_pytorch_checkpoint_to_pytorch import (
-    final,
-)
 
 ACT2FN = {"silu": nn.functional.silu}
 
@@ -288,6 +285,47 @@ class MyInklingTopkRouter(nn.Module):
         )
         self.global_scale = nn.Parameter(torch.ones(1))
         self.e_score_correction_bias = nn.Buffer(torch.zeros(self.num_experts))
+
+    def forward(
+        self, hidden_states: Fp[T, "bs s d"]
+    ) -> tuple[
+        Fp[T, "bs*s e_r"],  # routed logits
+        Fp[T, "bs*s k"],  # routed weights
+        Int[T, "bs*s k"],  # routed expert indices
+        Fp[T, "bs*s e_s"],  # shared expert weights
+    ]:
+        """
+        t: total tokens
+        e: total experts
+        e_r: routed experts
+        e_s: shared experts
+        """
+        flat = rearrange(hidden_states, "bs s d -> (bs s) d")
+        router_logits: Fp[T, "t total_experts"] = F.linear(flat, self.weight)
+
+        scores = router_logits.sigmoid()
+        routed_scores = scores[..., : -self.n_shared_experts]
+        scores_for_choice: Fp[T, "t e_r"] = routed_scores + self.e_score_correction_bias
+        topk_indices: Int[T, "t k"] = torch.topk(
+            scores_for_choice, self.top_k, dim=-1, sorted=False
+        )[1]
+
+        routed_logits: Fp[T, "t e_r"] = router_logits[..., : -self.n_shared_experts]
+        shared_logits: Fp[T, "t e_s"] = router_logits[..., -self.n_shared_experts :]
+        topk_logits: Fp[T, "t k+e_s"] = torch.cat(
+            [routed_logits.gather(-1, topk_indices), shared_logits], dim=-1
+        )
+        topk_log_probs = F.logsigmoid(topk_logits)
+        topk_weights = torch.exp(
+            topk_log_probs - torch.logsumexp(topk_log_probs, dim=-1, keepdim=True)
+        )
+
+        topk_weights = topk_weights * self.route_scale * self.global_scale
+
+        shared_gammas = topk_weights[..., -self.n_shared_experts :].contiguous()
+        topk_weights = topk_weights[..., : self.top_k].contiguous()
+
+        return routed_logits, topk_weights, topk_indices, shared_gammas
 
 
 class MyInklingMoE(nn.Module):
