@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from typing import Unpack
 
 import torch
 from einops import rearrange, repeat
@@ -8,9 +7,7 @@ from jaxtyping import Float as Fp
 from torch import Tensor as T
 from torch import nn
 from torch.nn import functional as F
-from transformers import AutoProcessor, InklingForConditionalGeneration
-from transformers.cache_utils import Cache  # TODO: remove import
-from transformers.utils import TransformersKwargs  # TODO: remove import
+from transformers import InklingForConditionalGeneration
 
 ACT2FN = {"silu": nn.functional.silu}
 
@@ -403,20 +400,11 @@ class MyInklingShortConv(nn.Module):
     def forward(
         self,
         hidden_states: Fp[T, "bs s d"],
-        past_key_values: Cache | None = None,
-        conv_mask: Bool[T, "bs s"] | None = None,
-        **kwargs: Unpack[TransformersKwargs],
     ) -> Fp[T, "bs s d"]:
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.float()
 
         residual = hidden_states
-
-        # apply_mask_to_padding_states
-        if conv_mask is not None:
-            hidden_states = (hidden_states * conv_mask.unsqueeze(-1)).to(
-                hidden_states.dtype
-            )
 
         seq_len = hidden_states.shape[1]
         hidden_states = rearrange(hidden_states, "bs s d -> bs d s")
@@ -491,31 +479,16 @@ class MyInklingAttention(nn.Module):
     def forward(
         self,
         hidden_states: Fp[T, "bs s d"],
-        attention_mask: Fp[T, "#bs 1 s k_len"] | None,
-        conv_mask: Bool[T, "bs s"] | None = None,
-        past_key_values: Cache | None = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple[Fp[T, "bs s d"], None]:
+    ) -> Fp[T, "bs s d"]:
         """Return SDPA output without materializing attention probabilities."""
-        if past_key_values is not None:
-            raise NotImplementedError(
-                "Cached attention requires convolution-state support in MyInklingShortConv."
-            )
-
         _q_proj = self.q_proj(hidden_states)
         q_proj = rearrange(
             _q_proj, "bs s (h c) -> bs h s c", h=self.num_heads, c=self.head_dim
         )
         query_states: Fp[T, "bs h s c"] = self.q_norm(q_proj)
 
-        key_projection: Fp[T, "bs s hk_c"] = self.k_sconv(
-            self.k_proj(hidden_states),
-            conv_mask=conv_mask,
-        )
-        value_projection: Fp[T, "bs s hk_c"] = self.v_sconv(
-            self.v_proj(hidden_states),
-            conv_mask=conv_mask,
-        )
+        key_projection: Fp[T, "bs s hk_c"] = self.k_sconv(self.k_proj(hidden_states))
+        value_projection: Fp[T, "bs s hk_c"] = self.v_sconv(self.v_proj(hidden_states))
 
         _key_states = rearrange(
             key_projection,
@@ -558,19 +531,16 @@ class MyInklingAttention(nn.Module):
             query_states = (query_states.float() * tau).to(query_states.dtype)
             position_bias = (position_bias.float() * tau).to(position_bias.dtype)
 
-        # SDPA receives relative bias through its floating-point additive mask.
-        # A supplied mask already encodes causality, sliding windows and padding.
-        sdpa_mask: Fp[T, "bs h s k_len"] = position_bias
-        if attention_mask is not None:
-            sdpa_mask = sdpa_mask + attention_mask.to(query_states.dtype)
-        else:
-            distance: Int[T, "s k_len"] = rearrange(
-                q_positions, "s -> s 1"
-            ) - rearrange(kv_positions, "k_len -> 1 k_len")
-            allowed: Bool[T, "s k_len"] = distance >= 0
-            if self.sliding_window is not None:
-                allowed = allowed & (distance < self.sliding_window)
-            sdpa_mask = sdpa_mask.masked_fill(~allowed, float("-inf"))
+        # Combine relative bias with causal and sliding-window restrictions.
+        distance: Int[T, "s k_len"] = rearrange(q_positions, "s -> s 1") - rearrange(
+            kv_positions, "k_len -> 1 k_len"
+        )
+        allowed: Bool[T, "s k_len"] = distance >= 0
+        if self.sliding_window is not None:
+            allowed = allowed & (distance < self.sliding_window)
+        sdpa_mask: Fp[T, "bs h s k_len"] = position_bias.masked_fill(
+            ~allowed, float("-inf")
+        )
 
         attn_output: Fp[T, "bs h s c"] = F.scaled_dot_product_attention(
             query_states,
@@ -586,7 +556,7 @@ class MyInklingAttention(nn.Module):
         output: Fp[T, "bs s d"] = self.o_proj(
             rearrange(attn_output, "bs h s c -> bs s (h c)").contiguous()
         )
-        return output, None
+        return output
 
 
 class MyInklingNormedEmbedding(nn.Embedding):
@@ -629,31 +599,17 @@ class MyInklingDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: Fp[T, "bs s d"],
-        attention_mask: Fp[T, "#bs 1 s k_len"] | None = None,
-        conv_mask: Bool[T, "bs s"] | None = None,
-        past_key_values: Cache | None = None,
-        **kwargs: Unpack[TransformersKwargs],
     ) -> Fp[T, "bs s d"]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states, _ = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            conv_mask=conv_mask,
-            past_key_values=past_key_values,
-            **kwargs,
-        )
-        hidden_states = self.attn_sconv(
-            hidden_states, past_key_values=past_key_values, conv_mask=conv_mask
-        )
+        hidden_states = self.self_attn(hidden_states)
+        hidden_states = self.attn_sconv(hidden_states)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = self.mlp_sconv(
-            hidden_states, past_key_values=past_key_values, conv_mask=conv_mask
-        )
+        hidden_states = self.mlp_sconv(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -676,132 +632,23 @@ class MyInklingTextTower(nn.Module):
         )
         self.norm = MyInklingRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(
-        self,
-        input_ids: Int[T, "bs s"] | None = None,
-        attention_mask: (
-            Bool[T, "bs s"]
-            | Int[T, "bs s"]
-            | Fp[T, "#bs 1 s s"]
-            | dict[str, T | None]
-            | None
-        ) = None,
-        past_key_values: Cache | None = None,
-        inputs_embeds: Fp[T, "bs s d"] | None = None,
-        use_cache: bool = False,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> Fp[T, "bs s d"]:
-        """Embed tokens, apply causal decoder layers, and normalize hidden states."""
-        if (input_ids is None) == (inputs_embeds is None):
-            raise ValueError("Specify exactly one of input_ids or inputs_embeds.")
-        if use_cache or past_key_values is not None:
-            raise NotImplementedError(
-                "Cached decoding requires convolution-state support; use use_cache=False."
-            )
-
-        hidden_states: Fp[T, "bs s d"] = (
-            self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
-        )
-        seq_len = hidden_states.shape[1]
-
-        if isinstance(attention_mask, dict):
-            masks = attention_mask
-        elif attention_mask is not None and attention_mask.ndim == 4:
-            # Prepared additive masks already encode their attention constraints.
-            masks = {
-                "full_attention": attention_mask,
-                "sliding_attention": attention_mask,
-                "linear_attention": None,
-            }
-        else:
-            positions: Int[T, " s"] = torch.arange(seq_len, device=hidden_states.device)
-            distance: Int[T, "s s"] = rearrange(positions, "s -> s 1") - rearrange(
-                positions, "s -> 1 s"
-            )
-            allowed: Bool[T, "#bs 1 s s"] = rearrange(distance >= 0, "q k -> 1 1 q k")
-            padding_mask: Bool[T, "bs s"] | None = None
-            if attention_mask is not None:
-                if attention_mask.shape != hidden_states.shape[:2]:
-                    raise ValueError("The padding mask must have shape [bs, s].")
-                padding_mask = attention_mask.to(
-                    device=hidden_states.device, dtype=torch.bool
-                )
-                allowed = allowed & rearrange(padding_mask, "bs s -> bs 1 1 s")
-
-            mask_values = hidden_states.new_zeros(allowed.shape)
-            masked_value = torch.finfo(hidden_states.dtype).min
-            full_mask: Fp[T, "#bs 1 s s"] = mask_values.masked_fill(
-                ~allowed, masked_value
-            )
-            sliding_allowed = allowed & (distance < self.config.sliding_window_size)
-            sliding_mask: Fp[T, "#bs 1 s s"] = mask_values.masked_fill(
-                ~sliding_allowed, masked_value
-            )
-            masks = {
-                "full_attention": full_mask,
-                "sliding_attention": sliding_mask,
-                # Match the reference's single-token convolution-mask behavior.
-                "linear_attention": padding_mask if seq_len > 1 else None,
-            }
-
+    def forward(self, input_ids: Int[T, "bs s"]) -> Fp[T, "bs s d"]:
+        """Process complete, unpadded token sequences without cached state."""
+        hidden_states = self.embed_tokens(input_ids)
         for layer in self.layers:
-            attention_type = (
-                "sliding_attention"
-                if layer.layer_type == "hybrid_sliding"
-                else "full_attention"
-            )
-            hidden_states = layer(
-                hidden_states,
-                attention_mask=masks[attention_type],
-                conv_mask=masks["linear_attention"],
-                **kwargs,
-            )
+            hidden_states = layer(hidden_states)
         return self.norm(hidden_states)
-
-
-class MyInklingVisionTower(nn.Module):
-    def __init__(self, config: InklingConfig):
-        super().__init__()
-        self.config = config
 
 
 class MyInklingModel(nn.Module):
     def __init__(self, config: InklingConfig):
         super().__init__()
         self.language_model = MyInklingTextTower(config.text_config)
-        self.audio_tower = None
-        self.vision_tower = MyInklingVisionTower(config)
+        self.audio_tower = None  # TODO: add vision & audio towers
+        self.vision_tower = None
 
-    def forward(
-        self,
-        input_ids: Int[T, "bs s"] | None = None,
-        attention_mask: (
-            Bool[T, "bs s"]
-            | Int[T, "bs s"]
-            | Fp[T, "#bs 1 s s"]
-            | dict[str, T | None]
-            | None
-        ) = None,
-        past_key_values: Cache | None = None,
-        inputs_embeds: Fp[T, "bs s d"] | None = None,
-        use_cache: bool = False,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> Fp[T, "bs s d"]:
-        if (
-            kwargs.get("pixel_values") is not None
-            or kwargs.get("audio_input_ids") is not None
-        ):
-            raise NotImplementedError(
-                "Vision and audio inputs are not implemented yet."
-            )
-        return self.language_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            **kwargs,
-        )
+    def forward(self, input_ids: Int[T, "bs s"]) -> Fp[T, "bs s d"]:
+        return self.language_model(input_ids)
 
 
 class MyInkling(nn.Module):
@@ -815,44 +662,15 @@ class MyInkling(nn.Module):
 
         self.mtp = None  # TODO: add MTP support
 
-    def forward(
-        self,
-        input_ids: Int[T, "bs s"] | None = None,
-        attention_mask: (
-            Bool[T, "bs s"]
-            | Int[T, "bs s"]
-            | Fp[T, "#bs 1 s s"]
-            | dict[str, T | None]
-            | None
-        ) = None,
-        past_key_values: Cache | None = None,
-        inputs_embeds: Fp[T, "bs s d"] | None = None,
-        use_cache: bool = False,
-        logits_to_keep: int | Int[T, " s_out"] = 0,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> Fp[T, "bs s_out vocab"]:
-        hidden_states = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            **kwargs,
-        )
+    def forward(self, input_ids: Int[T, "bs s"]) -> Fp[T, "bs 1 vocab"]:
+        """Return next-token logits for complete, unpadded token sequences."""
+        hidden_states = self.model(input_ids)[:, -1:, :]
         hidden_states = (
             hidden_states / self.config.text_config.logits_mup_width_multiplier
         )
-        if isinstance(logits_to_keep, int):
-            if logits_to_keep < 0:
-                raise ValueError("logits_to_keep must be non-negative.")
-            selected_positions = slice(-logits_to_keep, None)
-        else:
-            selected_positions = logits_to_keep
-        padded_logits: Fp[T, "bs s_out padded_vocab"] = self.lm_head(
-            hidden_states[:, selected_positions, :]
-        )
+        padded_logits: Fp[T, "bs 1 padded_vocab"] = self.lm_head(hidden_states)
         unpadded_vocab_size = self.config.text_config.unpadded_vocab_size
-        logits: Fp[T, "bs s_out vocab"] = (
+        logits: Fp[T, "bs 1 vocab"] = (
             padded_logits[..., :unpadded_vocab_size]
             if unpadded_vocab_size is not None
             else padded_logits
