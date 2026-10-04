@@ -33,3 +33,11 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 - `run_naive.py` is now running at ~8.6 s/tok! (only benchmarked 8 token generation haha)
 - Probably can optimize away a couple redundant reallocations; i.e. `torch.roll` probably isn't ideal
 - Need to add support for subsequent prefills after the first
+
+## 3. Adding tensor parallelism
+
+- `_VocabParallelEmbedding` performs a distributed embedding lookup
+  - We cannot just use `RowwiseParallel` because we only want to split the embed lookup, then all-reduce, and then perform the RMSNorm like normal. `RowwiseParallel` only works on `nn.Module`, not the `weight` parameter in `nn.Embedding`
+  - `DTensor.from_local` is needed because we call `redistribute` (the all-reduce) afterwards
+- `_HeadParallelConv1d` performs a local convolution, with the split inputs & sharded weights
+  - `self.weight.to_local()` is used here because everything is done locally with no collectives needed
