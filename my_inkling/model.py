@@ -9,6 +9,8 @@ from torch import nn
 from torch.nn import functional as F
 from transformers import InklingForConditionalGeneration
 
+from .cache import MyInklingCache
+
 ACT2FN = {"silu": nn.functional.silu}
 
 """
@@ -376,7 +378,7 @@ class MyInklingMoE(nn.Module):
 
 class MyInklingShortConv(nn.Module):
     """
-    TODO: What exactly is happening here? What is a 1d conv? Isn't that just a linear?
+    Convolutions
     """
 
     def __init__(
@@ -400,6 +402,7 @@ class MyInklingShortConv(nn.Module):
     def forward(
         self,
         hidden_states: Fp[T, "bs s d"],
+        cache: MyInklingCache | None = None,
     ) -> Fp[T, "bs s d"]:
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.float()
@@ -409,7 +412,26 @@ class MyInklingShortConv(nn.Module):
         seq_len = hidden_states.shape[1]
         hidden_states = rearrange(hidden_states, "bs s d -> bs d s")
 
+        use_cache = cache is not None
+        is_decode = (
+            use_cache
+            and cache.has_previous_state(self.layer_idx, self.conv_idx)
+            and seq_len == 1
+        )
+
+        orig_conv_padding = self.conv1d.padding
+        if use_cache:
+            _hidden_states = cache.update_conv_cache(
+                hidden_states, self.layer_idx, self.conv_idx
+            )
+
+        if is_decode:
+            self.conv1d.padding = 0
+            hidden_states = _hidden_states
+
+        # [..., :seq_len] has no affect for decode because padding is 0
         hidden_states = self.conv1d(hidden_states)[..., :seq_len]
+        self.conv1d.padding = orig_conv_padding
 
         hidden_states = rearrange(hidden_states, "bs d s -> bs s d")
         return (hidden_states + residual).to(input_dtype)
@@ -479,6 +501,7 @@ class MyInklingAttention(nn.Module):
     def forward(
         self,
         hidden_states: Fp[T, "bs s d"],
+        cache: MyInklingCache | None = None,
     ) -> Fp[T, "bs s d"]:
         """Return SDPA output without materializing attention probabilities."""
         _q_proj = self.q_proj(hidden_states)
@@ -487,8 +510,12 @@ class MyInklingAttention(nn.Module):
         )
         query_states: Fp[T, "bs h s c"] = self.q_norm(q_proj)
 
-        key_projection: Fp[T, "bs s hk_c"] = self.k_sconv(self.k_proj(hidden_states))
-        value_projection: Fp[T, "bs s hk_c"] = self.v_sconv(self.v_proj(hidden_states))
+        key_projection: Fp[T, "bs s hk_c"] = self.k_sconv(
+            self.k_proj(hidden_states), cache=cache
+        )
+        value_projection: Fp[T, "bs s hk_c"] = self.v_sconv(
+            self.v_proj(hidden_states), cache=cache
+        )
 
         _key_states = rearrange(
             key_projection,
@@ -503,17 +530,31 @@ class MyInklingAttention(nn.Module):
             hk=self.num_key_value_heads,
             c=self.head_dim,
         )
+
+        q_len = query_states.shape[2]
+        query_start = 0
+
+        if cache is not None:
+            query_start = cache.layers[self.layer_idx].tokens_seen
+            key_states, value_states = cache.update_attn_cache(
+                key_states, value_states, self.layer_idx
+            )
+
         relative_states: Fp[T, "bs s h r"] = rearrange(
             self.r_proj(hidden_states),
             "bs s (h r) -> bs s h r",
             h=self.num_heads,
         )
 
-        q_positions: Int[T, " s"] = torch.arange(
-            query_states.shape[2], device=hidden_states.device
+        kv_len = key_states.shape[2]
+        tokens_seen_after_update = query_start + q_len
+        key_start = tokens_seen_after_update - kv_len
+
+        q_positions: Int[T, " s"] = (
+            torch.arange(q_len, device=hidden_states.device) + query_start
         )
-        kv_positions: Int[T, " k_len"] = torch.arange(
-            key_states.shape[2], device=hidden_states.device
+        kv_positions: Int[T, " k_len"] = (
+            torch.arange(kv_len, device=hidden_states.device) + key_start
         )
         position_bias: Fp[T, "bs h s k_len"] = self.rel_logits_proj(
             relative_states, q_positions, kv_positions
@@ -599,17 +640,18 @@ class MyInklingDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: Fp[T, "bs s d"],
+        cache: MyInklingCache | None = None,
     ) -> Fp[T, "bs s d"]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states)
-        hidden_states = self.attn_sconv(hidden_states)
+        hidden_states = self.self_attn(hidden_states, cache=cache)
+        hidden_states = self.attn_sconv(hidden_states, cache=cache)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = self.mlp_sconv(hidden_states)
+        hidden_states = self.mlp_sconv(hidden_states, cache=cache)
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -632,11 +674,13 @@ class MyInklingTextTower(nn.Module):
         )
         self.norm = MyInklingRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, input_ids: Int[T, "bs s"]) -> Fp[T, "bs s d"]:
-        """Process complete, unpadded token sequences without cached state."""
+    def forward(
+        self, input_ids: Int[T, "bs s"], cache: MyInklingCache | None = None
+    ) -> Fp[T, "bs s d"]:
+        """Process unpadded tokens with an optional request-scoped cache."""
         hidden_states = self.embed_tokens(input_ids)
         for layer in self.layers:
-            hidden_states = layer(hidden_states)
+            hidden_states = layer(hidden_states, cache=cache)
         return self.norm(hidden_states)
 
 
@@ -647,8 +691,10 @@ class MyInklingModel(nn.Module):
         self.audio_tower = None  # TODO: add vision & audio towers
         self.vision_tower = None
 
-    def forward(self, input_ids: Int[T, "bs s"]) -> Fp[T, "bs s d"]:
-        return self.language_model(input_ids)
+    def forward(
+        self, input_ids: Int[T, "bs s"], cache: MyInklingCache | None = None
+    ) -> Fp[T, "bs s d"]:
+        return self.language_model(input_ids, cache=cache)
 
 
 class MyInkling(nn.Module):
@@ -662,9 +708,11 @@ class MyInkling(nn.Module):
 
         self.mtp = None  # TODO: add MTP support
 
-    def forward(self, input_ids: Int[T, "bs s"]) -> Fp[T, "bs 1 vocab"]:
-        """Return next-token logits for complete, unpadded token sequences."""
-        hidden_states = self.model(input_ids)[:, -1:, :]
+    def forward(
+        self, input_ids: Int[T, "bs s"], cache: MyInklingCache | None = None
+    ) -> Fp[T, "bs 1 vocab"]:
+        """Return next-token logits, optionally updating a request-scoped cache."""
+        hidden_states = self.model(input_ids, cache=cache)[:, -1:, :]
         hidden_states = (
             hidden_states / self.config.text_config.logits_mup_width_multiplier
         )
