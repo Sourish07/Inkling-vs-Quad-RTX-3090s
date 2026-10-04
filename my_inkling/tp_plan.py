@@ -1,4 +1,4 @@
-"""Tensor parallelism for Inkling's text tower (expert weights stay replicated)."""
+"""Tensor parallelism for Inkling's text tower (routed experts stay replicated)."""
 
 import torch
 from jaxtyping import Float as Fp
@@ -19,7 +19,9 @@ from .model import (
     MyInkling,
     MyInklingAttention,
     MyInklingMLP,
+    MyInklingMoE,
     MyInklingNormedEmbedding,
+    MyInklingSharedExperts,
 )
 
 
@@ -57,6 +59,39 @@ class _VocabParallelEmbedding(MyInklingNormedEmbedding):
         # All-reduce is performed implicitly during `redistribute`
         embeddings = embeddings.redistribute(placements=[Replicate()]).to_local()
         return self.embed_norm(embeddings)
+
+
+class _TPSharedExperts(MyInklingSharedExperts):
+    """Shard shared-expert intermediate features and reduce their partial output."""
+
+    def __init__(self, shared: MyInklingSharedExperts, mesh: DeviceMesh):
+        nn.Module.__init__(self)
+        self.n_shared_experts = shared.n_shared_experts
+        self.act_fn = shared.act_fn
+        self.device_mesh = mesh
+        for name, dim in (("gate_proj", 1), ("up_proj", 1), ("down_proj", 2)):
+            weight = getattr(shared, name)
+            self.register_parameter(
+                name,
+                nn.Parameter(
+                    distribute_tensor(weight, mesh, [Shard(dim)], src_data_rank=None),
+                    requires_grad=weight.requires_grad,
+                ),
+            )
+        self.train(shared.training)
+
+    def forward(
+        self, hidden_states: Fp[T, "bs s d"], gammas: Fp[T, "bs*s e_s"]
+    ) -> Fp[T, "bs s d"]:
+        hidden_states = DTensor.from_local(
+            hidden_states, self.device_mesh, [Replicate()], run_check=False
+        )
+        gammas = DTensor.from_local(
+            gammas, self.device_mesh, [Replicate()], run_check=False
+        )
+        output = super().forward(hidden_states, gammas)
+        assert isinstance(output, DTensor)
+        return output.redistribute(placements=[Replicate()]).to_local()
 
 
 class _HeadParallelConv1d(nn.Conv1d):
@@ -139,6 +174,10 @@ def apply_tp_plan(
                     "down_proj": RowwiseParallel(),
                 },
                 src_data_rank=None,
+            )
+        elif isinstance(layer.mlp, MyInklingMoE):
+            layer.mlp.shared_experts = _TPSharedExperts(
+                layer.mlp.shared_experts, device_mesh
             )
 
     parallelize_module(

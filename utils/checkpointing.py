@@ -69,7 +69,10 @@ def load_non_expert_state_dict(
     model: torch.nn.Module, checkpoint_dir: str | Path, device_mesh: DeviceMesh
 ) -> dict[str, torch.Tensor]:
     """
-    Read one weight tensor at a time on rank 0 and then shard + distribute.
+    Read dense and shared-expert weights on rank 0, then shard and distribute.
+
+    Routed expert banks are excluded. Shared experts use the DTensor placements
+    installed by ``apply_tp_plan``, including converted gate/up tensors.
 
     use `model.load_state_dict(state, strict=False, assign=True)`
     """
@@ -91,7 +94,6 @@ def load_non_expert_state_dict(
                 if (
                     not key.startswith("model.llm.")
                     or ".mlp.experts." in key
-                    or ".mlp.shared_experts." in key
                     or key.endswith((".original_shape", ".input_amax"))
                 ):
                     continue
