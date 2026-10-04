@@ -152,9 +152,24 @@ def build_model(config, raw_tensors):
     return model.eval().requires_grad_(False)
 
 
-def load_weights(model, files, raw_tensors, device_map):
+def load_weights(model, files, raw_tensors, device_map, *, skip_checkpoint_loading=False):
     """Stream converted tensors into Accelerate's placements without a second checkpoint."""
     placements = sorted(device_map.items(), key=lambda item: len(item[0]), reverse=True)
+    if skip_checkpoint_loading:
+        print("Skipping checkpoint loading; allocating placeholder weights", file=sys.stderr)
+        for name, tensor in model.state_dict().items():
+            device = next(
+                device
+                for prefix, device in placements
+                if not prefix or name == prefix or name.startswith(prefix + ".")
+            )
+            target = f"cuda:{device}" if isinstance(device, int) else device
+            value = torch.zeros(tensor.shape, dtype=tensor.dtype, device=target)
+            if name.endswith(("_scale", "_scale2", "global_scale")):
+                value.fill_(1)
+            set_module_tensor_to_device(model, name, device, value=value, clear_cache=False)
+        return dispatch_model(model, device_map=device_map, offload_buffers=True)
+
     for file in files:
         print(f"Loading {file.name}", file=sys.stderr, flush=True)
         with safe_open(file, framework="pt", device="cpu") as handle:
@@ -212,6 +227,7 @@ def main(
     cpu_gib: float = 100,
     max_sequence_length: int = 512,
     plan: bool = False,
+    skip_checkpoint_loading: bool = False,
 ):
     """Generate greedily, recomputing the sequence each token.
 
@@ -224,6 +240,8 @@ def main(
         cpu_gib: CPU weight budget in GiB; capped by available RAM minus 8 GiB.
         max_sequence_length: Prompt plus generation limit for this uncached sample.
         plan: Show Accelerate's placements without loading tensors.
+        skip_checkpoint_loading: Allocate placeholder weights for the configured model
+            instead of reading checkpoint tensors; config, headers, and tokenizer are still used.
     """
     if max_new_tokens < 1:
         raise ValueError("max_new_tokens must be positive")
@@ -288,7 +306,10 @@ def main(
     )
     input_ids = input_ids.to(input_device)
     started = time.monotonic()
-    model = load_weights(model, files, raw_tensors, device_map)
+    model = load_weights(
+        model, files, raw_tensors, device_map,
+        skip_checkpoint_loading=skip_checkpoint_loading,
+    )
     print(
         f"Loaded in {time.monotonic() - started:.2f}s; prompt: {input_ids.shape[-1]} tokens",
         file=sys.stderr,
