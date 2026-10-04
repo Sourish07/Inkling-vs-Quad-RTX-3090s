@@ -7,6 +7,8 @@ import json
 import os
 import sys
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import psutil
@@ -74,7 +76,9 @@ class PackedExperts(nn.Module):
         for name, tensor in tensors.items():
             self.register_buffer(name, tensor)
 
-    def matrix(self, projection: str, index: int, dtype: torch.dtype) -> Fp[T, "rows cols"]:
+    def matrix(
+        self, projection: str, index: int, dtype: torch.dtype
+    ) -> Fp[T, "rows cols"]:
         weight: Shaped[T, "rows stored_cols"] = getattr(self, projection)[index]
         if weight.dtype != torch.uint8:
             return weight
@@ -118,11 +122,19 @@ class PackedExperts(nn.Module):
 def checkpoint_headers(path):
     """Read only text weights; auxiliary quantization records are not model tensors."""
     tensors = {}
-    files = sorted(file for file in Path(path).glob("*.safetensors") if file.name != "mtp.safetensors")
+    files = sorted(
+        file
+        for file in Path(path).glob("*.safetensors")
+        if file.name != "mtp.safetensors"
+    )
     for file in files:
         for key, info in parse_local_safetensors_file_metadata(file).tensors.items():
-            if key.startswith("model.llm.") and not key.endswith((".original_shape", ".input_amax")):
-                tensors[key] = torch.empty(info.shape, dtype=DTYPES[info.dtype], device="meta")
+            if key.startswith("model.llm.") and not key.endswith(
+                (".original_shape", ".input_amax")
+            ):
+                tensors[key] = torch.empty(
+                    info.shape, dtype=DTYPES[info.dtype], device="meta"
+                )
     return files, tensors
 
 
@@ -134,24 +146,37 @@ def build_model(config, raw_tensors):
             if isinstance(layer.mlp, MyInklingMoE):
                 prefix = f"model.language_model.layers.{i}.mlp.experts."
                 layer.mlp.experts = PackedExperts(
-                    {key.removeprefix(prefix): value for key, value in tensors.items() if key.startswith(prefix)}
+                    {
+                        key.removeprefix(prefix): value
+                        for key, value in tensors.items()
+                        if key.startswith(prefix)
+                    }
                 )
-                layer.mlp.gate.e_score_correction_bias = layer.mlp.gate.e_score_correction_bias.float()
+                layer.mlp.gate.e_score_correction_bias = (
+                    layer.mlp.gate.e_score_correction_bias.float()
+                )
         for name, parameter in model.named_parameters():
             if "conv1d.weight" in name:
                 parameter.data = parameter.float()
     if set(model.state_dict()) != set(tensors):
-        raise ValueError(f"Checkpoint/model keys differ: {set(model.state_dict()) ^ set(tensors)}")
+        raise ValueError(
+            f"Checkpoint/model keys differ: {set(model.state_dict()) ^ set(tensors)}"
+        )
     return model.eval().requires_grad_(False)
 
 
 def expert_placements(model, mesh, gpu_gib, cpu_gib):
     """Let Accelerate place whole banks after reserving resident TP weights."""
-    banks = {name: module for name, module in model.named_modules() if isinstance(module, PackedExperts)}
+    banks = {
+        name: module
+        for name, module in model.named_modules()
+        if isinstance(module, PackedExperts)
+    }
     if not banks:
         return {}
     resident = sum(
-        (tensor.to_local() if isinstance(tensor, DTensor) else tensor).numel() * tensor.element_size()
+        (tensor.to_local() if isinstance(tensor, DTensor) else tensor).numel()
+        * tensor.element_size()
         for name, tensor in model.state_dict().items()
         if ".mlp.experts." not in name
     )
@@ -160,7 +185,9 @@ def expert_placements(model, mesh, gpu_gib, cpu_gib):
         if mesh.device_type == "cuda"
         else {}
     )
-    memory["cpu"] = min(int(cpu_gib * GIB), max(0, psutil.virtual_memory().available - 8 * GIB))
+    memory["cpu"] = min(
+        int(cpu_gib * GIB), max(0, psutil.virtual_memory().available - 8 * GIB)
+    )
     # Rank 0 chooses once: available host RAM can differ slightly across processes.
     placements = [{}]
     if mesh.get_local_rank() == 0:
@@ -174,15 +201,37 @@ def expert_placements(model, mesh, gpu_gib, cpu_gib):
         placements[0] = {name: devices[str(i)] for i, name in enumerate(banks)}
     dist.broadcast_object_list(placements, src=0, group=mesh.get_group())
     if "disk" in placements[0].values():
-        raise ValueError("Routed experts exceed the GPU/CPU budgets; disk offload is disabled")
+        raise ValueError(
+            "Routed experts exceed the GPU/CPU budgets; disk offload is disabled"
+        )
     return placements[0]
 
 
-def load_weights(model, path, files, raw_tensors, device_map, mesh, *, skip_checkpoint_loading=False):
+def load_weights(
+    model,
+    path,
+    files,
+    raw_tensors,
+    device_map,
+    mesh,
+    *,
+    skip_checkpoint_loading=False,
+    cpu_load_workers=16,
+):
     """Load TP weights through the shared loader; stream each bank only on its owner."""
+    if cpu_load_workers < 1:
+        raise ValueError("cpu_load_workers must be positive")
     rank = mesh.get_local_rank()
-    device = torch.device("cuda", torch.cuda.current_device()) if mesh.device_type == "cuda" else torch.device("cpu")
-    owned = {name: storage for name, storage in device_map.items() if (0 if storage == "cpu" else storage) == rank}
+    device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if mesh.device_type == "cuda"
+        else torch.device("cpu")
+    )
+    owned = {
+        name: storage
+        for name, storage in device_map.items()
+        if (0 if storage == "cpu" else storage) == rank
+    }
     for name in device_map:
         if name not in owned:
             model.set_submodule(name, PackedExperts({}, mesh))
@@ -203,32 +252,68 @@ def load_weights(model, path, files, raw_tensors, device_map, mesh, *, skip_chec
                 tensor.fill_(1)
     model.load_state_dict(state, strict=False, assign=True)
     del state
-    for file in files:
-        with safe_open(file, framework="pt", device="cpu") as handle:
-            for key in handle.keys():  # noqa: SIM118 -- safe_open is not a dict
-                if key not in raw_tensors or ".mlp.experts." not in key:
-                    continue
-                name = next(iter(convert_checkpoint_tensors({key: raw_tensors[key]}, packed_experts=True)))
-                bank_name = name.rsplit(".", 1)[0]
-                if bank_name not in owned:
-                    continue
-                value = (
-                    torch.zeros_like(raw_tensors[key], device="cpu")
-                    if skip_checkpoint_loading
-                    else handle.get_tensor(key)
-                )
-                if skip_checkpoint_loading and name.endswith(("_scale", "_scale2")):
-                    value.fill_(1)
-                if owned[bank_name] == "cpu":
-                    value = value.clone()  # Own host storage instead of retaining the checkpoint mmap.
-                set_module_tensor_to_device(model, name, owned[bank_name], value=value, clear_cache=False)
-                del value
+    # Native tensor copies release the GIL. Bound outstanding copies so completed
+    # host tensors cannot accumulate outside the model. Only this thread mutates it.
+    pending = deque()
+    with ThreadPoolExecutor(
+        max_workers=cpu_load_workers, initializer=torch.init_num_threads
+    ) as pool:
+        for file in files:
+            with safe_open(file, framework="pt", device="cpu") as handle:
+                for key in handle.keys():  # noqa: SIM118 -- safe_open is not a dict
+                    if key not in raw_tensors or ".mlp.experts." not in key:
+                        continue
+                    name = next(
+                        iter(
+                            convert_checkpoint_tensors(
+                                {key: raw_tensors[key]}, packed_experts=True
+                            )
+                        )
+                    )
+                    bank_name = name.rsplit(".", 1)[0]
+                    if bank_name not in owned:
+                        continue
+                    value = (
+                        torch.zeros_like(raw_tensors[key], device="cpu")
+                        if skip_checkpoint_loading
+                        else handle.get_tensor(key)
+                    )
+                    if skip_checkpoint_loading and name.endswith(("_scale", "_scale2")):
+                        value.fill_(1)
+                    if owned[bank_name] == "cpu" and cpu_load_workers > 1:
+                        pending.append((name, pool.submit(value.clone)))
+                        del value
+                        if len(pending) < cpu_load_workers:
+                            continue
+                        name, future = pending.popleft()
+                        value = future.result()
+                        storage = "cpu"
+                    else:
+                        if owned[bank_name] == "cpu":
+                            value = value.clone()  # Own host storage instead of retaining the checkpoint mmap.
+                        storage = owned[bank_name]
+                    set_module_tensor_to_device(
+                        model, name, storage, value=value, clear_cache=False
+                    )
+                    del value
+                # Finish copies while this file's mapping is still open.
+                while pending:
+                    name, future = pending.popleft()
+                    value = future.result()
+                    set_module_tensor_to_device(
+                        model, name, "cpu", value=value, clear_cache=False
+                    )
+                    del value
     if any(tensor.is_meta for tensor in model.state_dict().values()):
         raise ValueError("Some model tensors were not loaded")
     if device.type == "cuda":
         for name, storage in owned.items():
             if storage == "cpu":
-                cpu_offload(model.get_submodule(name), execution_device=device, offload_buffers=True)
+                cpu_offload(
+                    model.get_submodule(name),
+                    execution_device=device,
+                    offload_buffers=True,
+                )
     return model
 
 
@@ -261,6 +346,7 @@ def main(
     gpus: str = "0,1,2,3",
     gpu_gib: float = 20,
     cpu_gib: float = 100,
+    cpu_load_workers: int = 16,
     max_sequence_length: int = 512,
     plan: bool = False,
     skip_checkpoint_loading: bool = False,
@@ -274,19 +360,22 @@ def main(
         gpus: Visible GPU IDs; launch one torchrun process per GPU. Empty string uses CPU.
         gpu_gib: Weight budget per GPU in GiB; leave room for decoding and activations.
         cpu_gib: CPU weight budget in GiB; capped by available RAM minus 8 GiB.
+        cpu_load_workers: Concurrent CPU expert copies during loading; 1 uses serial copies.
         max_sequence_length: Prompt plus generation limit for this sample.
         plan: Show Accelerate's routed-expert placements without loading tensors.
         skip_checkpoint_loading: Allocate placeholder weights for the configured model
             instead of reading checkpoint tensors; config, headers, and tokenizer are still used.
     """
-    if max_new_tokens < 1:
-        raise ValueError("max_new_tokens must be positive")
     os.environ["CUDA_VISIBLE_DEVICES"] = gpus
     distributed = PartialState(cpu=not gpus)
     if gpus and distributed.num_processes != len(gpus.split(",")):
-        raise ValueError("Launch with torchrun --standalone --nproc-per-node=<number of GPUs>")
+        raise ValueError(
+            "Launch with torchrun --standalone --nproc-per-node=<number of GPUs>"
+        )
     if not dist.is_initialized():
-        dist.init_process_group("nccl" if gpus else "gloo", store=dist.HashStore(), rank=0, world_size=1)
+        dist.init_process_group(
+            "nccl" if gpus else "gloo", store=dist.HashStore(), rank=0, world_size=1
+        )
     device = torch.device(distributed.device)
     mesh = init_device_mesh(device.type, (distributed.num_processes,))
     path = (
@@ -332,7 +421,14 @@ def main(
     input_ids = input_ids.to(device)
     started = time.monotonic()
     model = load_weights(
-        model, path, files, raw_tensors, device_map, mesh, skip_checkpoint_loading=skip_checkpoint_loading
+        model,
+        path,
+        files,
+        raw_tensors,
+        device_map,
+        mesh,
+        skip_checkpoint_loading=skip_checkpoint_loading,
+        cpu_load_workers=cpu_load_workers,
     )
     if distributed.is_main_process:
         print(
