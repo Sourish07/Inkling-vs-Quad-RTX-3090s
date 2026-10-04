@@ -10,3 +10,4 @@
 - Also, organized repo so model definition lives in `my_inkling/` module
 - utils/ will contain checkpointing & torch.distributed utilities
 - `run_naive.py` runs the model on a single GPU using other cards & host memory as staging room for additional weights. It uses accelerate for cpu offloading and Nvidia's ModelOpt to dequantize selected experts on the fly.
+  - Running at ~10 s/tok! (lol)
