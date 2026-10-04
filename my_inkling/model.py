@@ -677,7 +677,7 @@ class MyInklingTextTower(nn.Module):
     def forward(
         self, input_ids: Int[T, "bs s"], cache: MyInklingCache | None = None
     ) -> Fp[T, "bs s d"]:
-        """Process complete, unpadded token sequences without cached state."""
+        """Process unpadded tokens with an optional request-scoped cache."""
         hidden_states = self.embed_tokens(input_ids)
         for layer in self.layers:
             hidden_states = layer(hidden_states, cache=cache)
@@ -708,11 +708,11 @@ class MyInkling(nn.Module):
 
         self.mtp = None  # TODO: add MTP support
 
-        self.cache = MyInklingCache(config.text_config)
-
-    def forward(self, input_ids: Int[T, "bs s"]) -> Fp[T, "bs 1 vocab"]:
-        """Return next-token logits for complete, unpadded token sequences."""
-        hidden_states = self.model(input_ids, cache=self.cache)[:, -1:, :]
+    def forward(
+        self, input_ids: Int[T, "bs s"], cache: MyInklingCache | None = None
+    ) -> Fp[T, "bs 1 vocab"]:
+        """Return next-token logits, optionally updating a request-scoped cache."""
+        hidden_states = self.model(input_ids, cache=cache)[:, -1:, :]
         hidden_states = (
             hidden_states / self.config.text_config.logits_mup_width_multiplier
         )
