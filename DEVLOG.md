@@ -41,3 +41,4 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
   - `DTensor.from_local` is needed because we call `redistribute` (the all-reduce) afterwards
 - `_HeadParallelConv1d` performs a local convolution, with the split inputs & sharded weights
   - `self.weight.to_local()` is used here because everything is done locally with no collectives needed
+- `_TPSharedExperts` is needed because shared experts use raw 3D parameters rather than `nn.Linear` modules
