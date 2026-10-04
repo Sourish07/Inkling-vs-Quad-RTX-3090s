@@ -8,7 +8,7 @@ from huggingface_hub import HfApi
 from huggingface_hub.utils import SafetensorsFileMetadata
 from transformers import AutoConfig
 
-from model.model import MyInkling
+from my_inkling import MyInkling
 from utils.checkpointing import convert_checkpoint_shapes
 
 

@@ -30,7 +30,7 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-# Tests import the code as `model...`, so put the repo root on sys.path.
+# Tests import `my_inkling`, so put the repo root on sys.path.
 pythonpath = ["."]
 
 [tool.ty.rules]

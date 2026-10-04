@@ -17,7 +17,8 @@ from transformers.models.inkling.configuration_inkling import (
     InklingVisionConfig,
 )
 
-from model import model as inkling
+from my_inkling import MyInkling
+from my_inkling import model as inkling
 
 
 @pytest.fixture(autouse=True)
@@ -337,7 +338,7 @@ def test_text_tower_fp32(seq_len: int, text_config: InklingTextConfig) -> None:
 )
 def test_model_fp32(with_lm_head: bool, config: InklingConfig) -> None:
     if with_lm_head:
-        actual = inkling.MyInkling(config)
+        actual = MyInkling(config)
         reference = hf.InklingForConditionalGeneration(config)
         ignored = ("model.audio_tower.", "model.vision_tower.")
         output_field = "logits"
@@ -361,7 +362,7 @@ def test_model_fp32(with_lm_head: bool, config: InklingConfig) -> None:
 def test_last_token_logits_fp32(seq_len: int, config: InklingConfig) -> None:
     config.text_config.unpadded_vocab_size = 29
     actual, reference = pair(
-        inkling.MyInkling(config),
+        MyInkling(config),
         hf.InklingForConditionalGeneration(config),
         ignored_prefixes=("model.audio_tower.", "model.vision_tower."),
     )
