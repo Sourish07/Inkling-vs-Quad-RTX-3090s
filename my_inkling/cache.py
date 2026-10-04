@@ -1,13 +1,15 @@
 """Cache shape names (batch size is currently fixed to 1).
 
 d                = feature/channel width
+hk               = key/value heads
+c                = head width
 s                = incoming sequence length
 conv_kernel_size = short-convolution buffer length
 capacity         = allocated full-attention buffer length
 k_len            = returned sliding-window buffer length
 
-The current attention buffers use [1, d, sequence] storage; the model's
-[batch, kv_heads, sequence, head_dim] layout still needs to be reconciled.
+Buffers are allocated on the first update, using the input tensor's device.
+K/V buffers also inherit the input dtype; convolution histories stay in FP32.
 """
 
 from typing import TYPE_CHECKING
@@ -48,12 +50,15 @@ class ShortConvLayerCache:
         else:
             dim = config.hidden_size
 
-        # bs=1 for now
-        self.cache = torch.zeros(
-            1, dim, self.conv_kernel_size, dtype=torch.float32, device=device
-        )
+        self.dim = dim
+        self.cache: Fp[T, "1 d conv_kernel_size"] | None = None
 
     def update_cache(self, tokens: Fp[T, "1 d s"]) -> Fp[T, "1 d conv_kernel_size"]:
+        if self.cache is None:
+            self.cache = tokens.new_zeros(
+                (1, self.dim, self.conv_kernel_size), dtype=torch.float32
+            )
+
         roll_size = min(tokens.shape[2], self.conv_kernel_size)
         self.cache = torch.roll(self.cache, -roll_size, dims=-1)
         self.cache[..., -roll_size:].copy_(tokens[:, :, -roll_size:])
@@ -82,23 +87,30 @@ class FullAttentionLayerCache:
         self.kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
 
-        self.k_cache = self.allocate()
-        self.v_cache = self.allocate()
+        self.k_cache: Fp[T, "1 hk capacity c"] | None = None
+        self.v_cache: Fp[T, "1 hk capacity c"] | None = None
         self.curr_size = 0
         self.tokens_seen = 0
 
-    def allocate(self, size: int = 256) -> Fp[T, "1 hk size c"]:
-        return torch.zeros((1, self.kv_heads, size, self.head_dim))
+    def allocate(
+        self, reference: Fp[T, "1 hk reference_length c"], size: int = 256
+    ) -> Fp[T, "1 hk size c"]:
+        return reference.new_zeros((1, self.kv_heads, size, self.head_dim))
 
     def extend_cache(self) -> None:
-        self.k_cache = torch.cat([self.k_cache, self.allocate()], dim=2)
-        self.v_cache = torch.cat([self.v_cache, self.allocate()], dim=2)
+        assert self.k_cache is not None and self.v_cache is not None
+        self.k_cache = torch.cat([self.k_cache, self.allocate(self.k_cache)], dim=2)
+        self.v_cache = torch.cat([self.v_cache, self.allocate(self.v_cache)], dim=2)
 
     def update_cache(
         self,
         key_states: Fp[T, "1 hk s c"],
         value_states: Fp[T, "1 hk s c"],
     ) -> tuple[Fp[T, "1 hk k_len c"], Fp[T, "1 hk k_len c"]]:
+        if self.k_cache is None:
+            self.k_cache = self.allocate(key_states)
+            self.v_cache = self.allocate(value_states)
+
         seq_len = key_states.shape[2]
 
         old_size = self.curr_size
@@ -134,22 +146,8 @@ class SlidingWindowAttentionLayerCache:
 
         self.sliding_window_size = config.sliding_window_size
 
-        self.k_cache = torch.zeros(
-            (
-                1,
-                config.swa_num_key_value_heads,
-                self.sliding_window_size,
-                config.swa_head_dim,
-            )
-        )
-        self.v_cache = torch.zeros(
-            (
-                1,
-                config.swa_num_key_value_heads,
-                self.sliding_window_size,
-                config.swa_head_dim,
-            )
-        )
+        self.k_cache: Fp[T, "1 hk capacity c"] | None = None
+        self.v_cache: Fp[T, "1 hk capacity c"] | None = None
         self.curr_size = 0
         self.tokens_seen = 0
 
@@ -161,6 +159,11 @@ class SlidingWindowAttentionLayerCache:
         roll_size = key_states.shape[2]
         # TODO: fix cases where prefill prompt > sliding window size
         assert roll_size <= self.sliding_window_size
+
+        if self.k_cache is None:
+            shape = (1, key_states.shape[1], self.sliding_window_size, key_states.shape[3])
+            self.k_cache = key_states.new_zeros(shape)
+            self.v_cache = value_states.new_zeros(shape)
 
         self.curr_size = min(self.curr_size + roll_size, self.sliding_window_size)
 
