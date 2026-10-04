@@ -1,6 +1,11 @@
-"""Convert Inkling checkpoint names and fused weights using Transformers' mapping."""
+"""Convert and load Inkling checkpoint tensors."""
+
+from pathlib import Path
 
 import torch
+from safetensors import safe_open
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Replicate, distribute_tensor
 from transformers.conversion_mapping import get_checkpoint_conversion_mapping
 from transformers.core_model_loading import WeightConverter, WeightRenaming
 
@@ -58,3 +63,65 @@ def convert_checkpoint_shapes(
         key: tuple(tensor.shape)
         for key, tensor in convert_checkpoint_tensors(tensors).items()
     }
+
+
+def load_non_expert_state_dict(
+    model: torch.nn.Module, checkpoint_dir: str | Path, device_mesh: DeviceMesh
+) -> dict[str, torch.Tensor]:
+    """
+    Read one weight tensor at a time on rank 0 and then shard + distribute.
+
+    use `model.load_state_dict(state, strict=False, assign=True)`
+    """
+    if device_mesh.ndim != 1:
+        raise ValueError("Pass the 1-D TP device mesh.")
+    rank = device_mesh.get_local_rank()
+    device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if device_mesh.device_type == "cuda"
+        else torch.device(device_mesh.device_type)
+    )
+    templates = model.state_dict()
+    state = {}
+    for file in sorted(Path(checkpoint_dir).glob("*.safetensors")):
+        if file.name == "mtp.safetensors":
+            continue
+        with safe_open(file, framework="pt", device=str(device)) as handle:
+            for key in sorted(handle.keys()):
+                if (
+                    not key.startswith("model.llm.")
+                    or ".mlp.experts." in key
+                    or ".mlp.shared_experts." in key
+                    or key.endswith((".original_shape", ".input_amax"))
+                ):
+                    continue
+                # All ranks read headers; only rank 0 reads the actual weight.
+                names = convert_checkpoint_tensors(
+                    {key: torch.empty(handle.get_slice(key).get_shape(), device="meta")}
+                )
+                names = [name for name in names if name in templates]
+                if not names:
+                    continue
+                converted = (
+                    convert_checkpoint_tensors({key: handle.get_tensor(key)})
+                    if rank == 0
+                    else {}
+                )
+                for name in names:
+                    target = templates[name]
+                    distributed = isinstance(target, DTensor)
+                    placements = target.placements if distributed else [Replicate()]
+                    full = (
+                        converted[name].to(dtype=target.dtype).contiguous()
+                        if rank == 0
+                        else torch.empty(
+                            target.shape, dtype=target.dtype, device=device
+                        )
+                    )
+                    value = distribute_tensor(
+                        full, device_mesh, placements, src_data_rank=0
+                    )
+                    state[name] = value if distributed else value.to_local()
+                    del full, value
+                del converted
+    return state
