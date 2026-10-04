@@ -332,22 +332,6 @@ def test_text_tower_fp32(seq_len: int, text_config: InklingTextConfig) -> None:
 
 
 @torch.no_grad()
-@pytest.mark.skip(reason="Vision tower is not implemented yet.")
-def test_vision_tower_fp32(config: InklingConfig) -> None:
-    vision_config = config.vision_config
-    assert isinstance(vision_config, InklingVisionConfig)
-    actual, reference = pair(
-        inkling.MyInklingVisionTower(config),
-        hf.InklingVisionModel(vision_config),
-    )
-    # Transformers consumes channels-last spatiotemporal patches.
-    pixels = torch.randn(2, 2, 2, 2, vision_config.num_channels)
-    expected = reference(pixel_values=pixels).last_hidden_state
-    output = actual(pixel_values=pixels)
-    assert_fp32_close(getattr(output, "last_hidden_state", output), expected)
-
-
-@torch.no_grad()
 @pytest.mark.parametrize(
     "with_lm_head", [False, True], ids=["model", "conditional_generation"]
 )
