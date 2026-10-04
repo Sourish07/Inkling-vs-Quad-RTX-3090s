@@ -27,3 +27,5 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 ```
 - Horribly wasteful for decode workloads... Only need to run the conv on full sequence for prefill
 - All we need to store is just the last `conv_kernel_size - 1` hidden states.
+- `run_naive.py` is now runnign at ~8 s/tok! (only benchmarked 8 token generation haha)
+- Probably can optimize away a couple redundant reallocations; i.e. `torch.roll` probably isn't ideal
