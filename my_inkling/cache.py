@@ -1,3 +1,15 @@
+"""Cache shape names (batch size is currently fixed to 1).
+
+d                = feature/channel width
+s                = incoming sequence length
+conv_kernel_size = short-convolution buffer length
+capacity         = allocated full-attention buffer length
+k_len            = returned sliding-window buffer length
+
+The current attention buffers use [1, d, sequence] storage; the model's
+[batch, kv_heads, sequence, head_dim] layout still needs to be reconciled.
+"""
+
 from typing import TYPE_CHECKING
 
 import torch
@@ -41,9 +53,10 @@ class ShortConvLayerCache:
             1, dim, self.conv_kernel_size, dtype=torch.float32, device=device
         )
 
-    def update_cache(self, token: Fp[T, "1 d"]) -> Fp[T, "1 d conv_kernel_size"]:
-        self.cache = torch.roll(self.cache, -1, dims=-1)
-        self.cache[..., -1].copy_(token)
+    def update_cache(self, tokens: Fp[T, "1 d s"]) -> Fp[T, "1 d conv_kernel_size"]:
+        roll_size = min(tokens.shape[2], self.conv_kernel_size)
+        self.cache = torch.roll(self.cache, -roll_size, dims=-1)
+        self.cache[..., -roll_size:].copy_(tokens[:, :, -roll_size:])
 
         self.initialized = True
 
@@ -66,28 +79,40 @@ class FullAttentionLayerCache:
             ShortConvLayerCache(config, is_kv_sconv=False, device=device),
             ShortConvLayerCache(config, is_kv_sconv=False, device=device),
         ]
+        self.kv_heads = config.num_key_value_heads
+        self.head_dim = config.head_dim
 
-        self.k_cache = torch.zeros((1, config.hidden_size, 256))
-        self.v_cache = torch.zeros((1, config.hidden_size, 256))
+        self.k_cache = self.allocate()
+        self.v_cache = self.allocate()
         self.curr_size = 0
+        self.tokens_seen = 0
 
-    def extend_cache(self):
-        self.k_cache = torch.cat(
-            [self.k_cache, torch.zeros((1, self.k_cache.shape[1], 256))], dim=2
-        )
-        self.v_cache = torch.cat(
-            [self.v_cache, torch.zeros((1, self.v_cache.shape[1], 256))], dim=2
-        )
+    def allocate(self, size: int = 256) -> Fp[T, "1 hk size c"]:
+        return torch.zeros((1, self.kv_heads, size, self.head_dim))
 
-    def update_cache(self, key_states: torch.Tensor, value_states: torch.Tensor):
-        self.curr_size += key_states.shape[2]
-        if self.curr_size >= self.k_cache.shape[2]:
+    def extend_cache(self) -> None:
+        self.k_cache = torch.cat([self.k_cache, self.allocate()], dim=2)
+        self.v_cache = torch.cat([self.v_cache, self.allocate()], dim=2)
+
+    def update_cache(
+        self,
+        key_states: Fp[T, "1 hk s c"],
+        value_states: Fp[T, "1 hk s c"],
+    ) -> tuple[Fp[T, "1 hk k_len c"], Fp[T, "1 hk k_len c"]]:
+        seq_len = key_states.shape[2]
+
+        old_size = self.curr_size
+        new_size = old_size + seq_len
+
+        while new_size > self.k_cache.shape[2]:
             self.extend_cache()
 
-        self.k_cache[:, :, -key_states.shape[2] :] = key_states
-        self.v_cache[:, :, -value_states.shape[2] :] = value_states
+        self.k_cache[:, :, old_size:new_size, :] = key_states
+        self.v_cache[:, :, old_size:new_size, :] = value_states
 
-        return self.k_cache, self.v_cache
+        self.curr_size = new_size
+        self.tokens_seen += seq_len
+        return self.k_cache[:, :, :new_size], self.v_cache[:, :, :new_size]
 
 
 class SlidingWindowAttentionLayerCache:
@@ -109,28 +134,55 @@ class SlidingWindowAttentionLayerCache:
 
         self.sliding_window_size = config.sliding_window_size
 
-        self.k_cache = torch.zeros((1, config.hidden_size, self.sliding_window_size))
-        self.v_cache = torch.zeros((1, config.hidden_size, self.sliding_window_size))
+        self.k_cache = torch.zeros(
+            (
+                1,
+                config.swa_num_key_value_heads,
+                self.sliding_window_size,
+                config.swa_head_dim,
+            )
+        )
+        self.v_cache = torch.zeros(
+            (
+                1,
+                config.swa_num_key_value_heads,
+                self.sliding_window_size,
+                config.swa_head_dim,
+            )
+        )
         self.curr_size = 0
+        self.tokens_seen = 0
 
-    def update_cache(self, key_states: torch.Tensor, value_states: torch.Tensor):
+    def update_cache(
+        self,
+        key_states: Fp[T, "1 hk s c"],
+        value_states: Fp[T, "1 hk s c"],
+    ) -> tuple[Fp[T, "1 hk k_len c"], Fp[T, "1 hk k_len c"]]:
         roll_size = key_states.shape[2]
-        self.curr_size = min(self.curr_size + roll_size, self.sliding_window_size)
-        assert roll_size < self.sliding_window_size
+        # TODO: fix cases where prefill prompt > sliding window size
+        assert roll_size <= self.sliding_window_size
 
-        torch.roll(self.k_cache, roll_size, dims=2)
-        torch.roll(self.v_cache, roll_size, dims=2)
+        self.curr_size = min(self.curr_size + roll_size, self.sliding_window_size)
+
+        self.k_cache = torch.roll(self.k_cache, -roll_size, dims=2)
+        self.v_cache = torch.roll(self.v_cache, -roll_size, dims=2)
 
         self.k_cache[:, :, -roll_size:] = key_states
         self.v_cache[:, :, -roll_size:] = value_states
 
-        return self.k_cache[:, :, : self.curr_size], self.v_cache[
-            :, :, : self.curr_size
+        self.tokens_seen += roll_size
+
+        return self.k_cache[:, :, -self.curr_size :], self.v_cache[
+            :, :, -self.curr_size :
         ]
 
 
 class MyInklingCache:
-    def __init__(self, config: "InklingTextConfig", device: torch.device | str = "cpu"):
+    def __init__(
+        self,
+        config: "InklingTextConfig",
+        device: torch.device | str = "cpu",
+    ):
         layer_classes = {
             "hybrid": FullAttentionLayerCache,
             "hybrid_sliding": SlidingWindowAttentionLayerCache,
@@ -141,16 +193,21 @@ class MyInklingCache:
         ]
 
     def update_attn_cache(
-        self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int
-    ):
-        self.layers[layer_idx].update_cache(key_states, value_states)
+        self,
+        key_states: Fp[T, "1 hk s c"],
+        value_states: Fp[T, "1 hk s c"],
+        layer_idx: int,
+    ) -> tuple[Fp[T, "1 hk k_len c"], Fp[T, "1 hk k_len c"]]:
+        return self.layers[layer_idx].update_cache(key_states, value_states)
 
     def update_conv_cache(
-        self, hidden_states: torch.Tensor, layer_idx: int, conv_idx: int
-    ):
-        self.layers[layer_idx].conv_caches[conv_idx].update_cache(hidden_states)
-        return hidden_states
+        self,
+        hidden_states: Fp[T, "1 d s"],
+        layer_idx: int,
+        conv_idx: int,
+    ) -> Fp[T, "1 d conv_kernel_size"]:
+        return self.layers[layer_idx].conv_caches[conv_idx].update_cache(hidden_states)
 
-    def has_previous_state(self, layer_idx, conv_idx) -> bool:
+    def has_previous_state(self, layer_idx: int, conv_idx: int) -> bool:
         conv_cache = self.layers[layer_idx].conv_caches[conv_idx]
         return conv_cache.initialized
