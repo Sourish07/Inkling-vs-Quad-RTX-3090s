@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING
 import torch
 from jaxtyping import Float as Fp
 from torch import Tensor as T
-from torch import nn
 
 if TYPE_CHECKING:
     from my_inkling.model import InklingTextConfig
@@ -161,7 +160,12 @@ class SlidingWindowAttentionLayerCache:
         assert roll_size <= self.sliding_window_size
 
         if self.k_cache is None:
-            shape = (1, key_states.shape[1], self.sliding_window_size, key_states.shape[3])
+            shape = (
+                1,
+                key_states.shape[1],
+                self.sliding_window_size,
+                key_states.shape[3],
+            )
             self.k_cache = key_states.new_zeros(shape)
             self.v_cache = value_states.new_zeros(shape)
 
