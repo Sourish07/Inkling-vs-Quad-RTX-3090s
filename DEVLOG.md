@@ -42,3 +42,4 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 - `_HeadParallelConv1d` performs a local convolution, with the split inputs & sharded weights
   - `self.weight.to_local()` is used here because everything is done locally with no collectives needed
 - `_TPSharedExperts` is needed because shared experts use raw 3D parameters rather than `nn.Linear` modules
+- `run_naive.py` now running at ~7.45 s/tok!
