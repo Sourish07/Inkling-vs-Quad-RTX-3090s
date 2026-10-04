@@ -1,4 +1,4 @@
-"""Slow, uncached generation: our Inkling model, Accelerate offload, ModelOpt NVFP4."""
+"""Cached generation: our Inkling model, Accelerate offload, ModelOpt NVFP4."""
 
 import json
 import sys
@@ -21,6 +21,7 @@ from torch.nn import functional as F
 from transformers import AutoConfig, AutoTokenizer
 
 from my_inkling import MyInkling
+from my_inkling.cache import MyInklingCache
 from my_inkling.model import MyInklingMoE
 from utils.checkpointing import convert_checkpoint_tensors
 
@@ -200,13 +201,14 @@ def load_weights(model, files, raw_tensors, device_map, *, skip_checkpoint_loadi
 
 @torch.inference_mode()
 def generate(model, input_ids, *, max_new_tokens, eos_token_ids):
+    cache = MyInklingCache(model.config.text_config)
     for step in range(max_new_tokens):
         started = time.monotonic()
-        logits = model(input_ids)[:, -1].float()
+        logits = model(input_ids, cache=cache)[:, -1].float()
         if not torch.isfinite(logits).all():
             raise RuntimeError("Non-finite logits")
         token = logits.argmax(dim=-1, keepdim=True)
-        input_ids = torch.cat((input_ids, token), dim=-1)
+        input_ids = token.to(input_ids.device)
         token_id = token.item()
         print(
             f"Token {step + 1}: id={token_id}, {time.monotonic() - started:.2f}s",
@@ -229,7 +231,7 @@ def main(
     plan: bool = False,
     skip_checkpoint_loading: bool = False,
 ):
-    """Generate greedily, recomputing the sequence each token.
+    """Generate greedily, prefilling once and decoding with cached state.
 
     Args:
         checkpoint: Local checkpoint directory or HF model ID (reuses the HF cache).
@@ -238,7 +240,7 @@ def main(
         gpus: Comma-separated GPU IDs; empty string runs on CPU.
         gpu_gib: Weight budget per GPU in GiB; leave room for decoding and activations.
         cpu_gib: CPU weight budget in GiB; capped by available RAM minus 8 GiB.
-        max_sequence_length: Prompt plus generation limit for this uncached sample.
+        max_sequence_length: Prompt plus generation limit for this sample.
         plan: Show Accelerate's placements without loading tensors.
         skip_checkpoint_loading: Allocate placeholder weights for the configured model
             instead of reading checkpoint tensors; config, headers, and tokenizer are still used.
