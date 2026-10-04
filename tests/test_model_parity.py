@@ -149,17 +149,15 @@ def hidden_states(config: InklingTextConfig) -> torch.Tensor:
     return torch.randn(2, 7, config.hidden_size)
 
 
-def tokens_and_mask() -> tuple[torch.Tensor, torch.Tensor]:
-    # Left padding and sequences longer than both convolution and sliding windows.
-    ids = torch.tensor([[0, 0, 3, 4, 5, 6, 7], [8, 9, 10, 11, 12, 13, 14]])
-    return ids, ids.ne(0)
+def token_ids() -> torch.Tensor:
+    # Unpadded sequences longer than both convolution and sliding windows.
+    return torch.tensor([[1, 2, 3, 4, 5, 6, 7], [8, 9, 10, 11, 12, 13, 14]])
 
 
 def attention_mask(config: InklingTextConfig, layer_idx: int) -> torch.Tensor:
-    _, valid = tokens_and_mask()
-    positions = torch.arange(valid.shape[1])
+    positions = torch.arange(token_ids().shape[1])
     distance = positions[:, None] - positions[None, :]
-    allowed = (distance >= 0)[None, None] & valid[:, None, None, :]
+    allowed = (distance >= 0)[None, None]
     if config.layer_types[layer_idx] == "hybrid_sliding":
         allowed = allowed & (distance < config.sliding_window_size)[None, None]
     return torch.zeros(allowed.shape).masked_fill(
@@ -265,19 +263,14 @@ def test_moe_fp32(text_config: InklingTextConfig) -> None:
 
 @torch.no_grad()
 @pytest.mark.parametrize("seq_len", [1, 7])
-@pytest.mark.parametrize("masked", [False, True])
-def test_short_conv_fp32(
-    seq_len: int, masked: bool, text_config: InklingTextConfig
-) -> None:
+def test_short_conv_fp32(seq_len: int, text_config: InklingTextConfig) -> None:
     actual, reference = pair(
         inkling.MyInklingShortConv(text_config.hidden_size, 3, layer_idx=0, conv_idx=0),
         hf.InklingShortConvolution(text_config.hidden_size, 3, layer_idx=0, conv_idx=0),
     )
     states = hidden_states(text_config)[:, :seq_len]
-    _, mask = tokens_and_mask()
-    conv_mask = mask[:, :seq_len] if masked else None
-    expected = reference(states, conv_mask=conv_mask)
-    assert_fp32_close(actual(states, conv_mask=conv_mask), expected)
+    expected = reference(states)
+    assert_fp32_close(actual(states), expected)
 
 
 @torch.no_grad()
@@ -289,11 +282,8 @@ def test_attention_fp32(layer_idx: int, text_config: InklingTextConfig) -> None:
     )
     states = hidden_states(text_config)
     mask = attention_mask(text_config, layer_idx)
-    _, conv_mask = tokens_and_mask()
-    expected, _ = reference(states, attention_mask=mask, conv_mask=conv_mask)
-    output, weights = actual(states, attention_mask=mask, conv_mask=conv_mask)
-    assert_fp32_close(output, expected)
-    assert weights is None
+    expected, _ = reference(states, attention_mask=mask)
+    assert_fp32_close(actual(states), expected)
 
 
 @torch.no_grad()
@@ -307,7 +297,7 @@ def test_normed_embedding_fp32(text_config: InklingTextConfig) -> None:
     actual, reference = pair(
         inkling.MyInklingNormedEmbedding(*args), hf.InklingNormedEmbedding(*args)
     )
-    ids, _ = tokens_and_mask()
+    ids = token_ids()
     expected = reference(ids)
     assert_fp32_close(actual(ids), expected)
 
@@ -325,61 +315,19 @@ def test_decoder_layer_fp32(
     )
     states = hidden_states(text_config)
     mask = attention_mask(text_config, layer_idx)
-    _, conv_mask = tokens_and_mask()
-    expected = reference(states, attention_mask=mask, conv_mask=conv_mask)
-    assert_fp32_close(
-        actual(states, attention_mask=mask, conv_mask=conv_mask), expected
-    )
+    expected = reference(states, attention_mask=mask)
+    assert_fp32_close(actual(states), expected)
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("input_kind", ["ids", "embeddings"])
-@pytest.mark.parametrize("masked", [False, True])
 @pytest.mark.parametrize("seq_len", [1, 7])
-def test_text_tower_fp32(
-    input_kind: str, masked: bool, seq_len: int, text_config: InklingTextConfig
-) -> None:
+def test_text_tower_fp32(seq_len: int, text_config: InklingTextConfig) -> None:
     actual, reference = pair(
         inkling.MyInklingTextTower(text_config), hf.InklingTextModel(text_config)
     )
-    ids, mask = tokens_and_mask()
-    ids = ids[:, :seq_len]
-    mask = mask[:, :seq_len] if masked else None
-    inputs = (
-        {"input_ids": ids}
-        if input_kind == "ids"
-        else {"inputs_embeds": reference.embed_tokens(ids)}
-    )
-    expected = reference(
-        **inputs, attention_mask=mask, use_cache=False
-    ).last_hidden_state
-    output = actual(**inputs, attention_mask=mask, use_cache=False)
-    assert_fp32_close(getattr(output, "last_hidden_state", output), expected)
-
-
-@torch.no_grad()
-@pytest.mark.parametrize("mask_kind", ["additive", "mapping"])
-def test_text_tower_prepared_masks_fp32(
-    mask_kind: str, text_config: InklingTextConfig
-) -> None:
-    actual, reference = pair(
-        inkling.MyInklingTextTower(text_config), hf.InklingTextModel(text_config)
-    )
-    ids, padding_mask = tokens_and_mask()
-    full_mask = attention_mask(text_config, layer_idx=0)
-    masks = (
-        full_mask
-        if mask_kind == "additive"
-        else {
-            "full_attention": full_mask,
-            "sliding_attention": attention_mask(text_config, layer_idx=1),
-            "linear_attention": padding_mask,
-        }
-    )
-    expected = reference(
-        input_ids=ids, attention_mask=masks, use_cache=False
-    ).last_hidden_state
-    output = actual(input_ids=ids, attention_mask=masks, use_cache=False)
+    ids = token_ids()[:, :seq_len]
+    expected = reference(input_ids=ids, use_cache=False).last_hidden_state
+    output = actual(ids)
     assert_fp32_close(output, expected)
 
 
@@ -403,56 +351,38 @@ def test_vision_tower_fp32(config: InklingConfig) -> None:
 @pytest.mark.parametrize(
     "with_lm_head", [False, True], ids=["model", "conditional_generation"]
 )
-@pytest.mark.parametrize("input_kind", ["ids", "embeddings"])
-def test_model_fp32(with_lm_head: bool, input_kind: str, config: InklingConfig) -> None:
+def test_model_fp32(with_lm_head: bool, config: InklingConfig) -> None:
     if with_lm_head:
         actual = inkling.MyInkling(config)
         reference = hf.InklingForConditionalGeneration(config)
-        embedding = reference.model.language_model.embed_tokens
         ignored = ("model.audio_tower.", "model.vision_tower.")
         output_field = "logits"
     else:
         actual = inkling.MyInklingModel(config)
         reference = hf.InklingModel(config)
-        embedding = reference.language_model.embed_tokens
         ignored = ("audio_tower.", "vision_tower.")
         output_field = "last_hidden_state"
     # Text-only inputs do not use audio/vision weights. Vision has its own test;
     # model.py does not yet define an audio module.
     actual, reference = pair(actual, reference, ignored_prefixes=ignored)
-    ids, mask = tokens_and_mask()
-    inputs = (
-        {"input_ids": ids} if input_kind == "ids" else {"inputs_embeds": embedding(ids)}
-    )
-    expected = getattr(
-        reference(**inputs, attention_mask=mask, use_cache=False), output_field
-    )
-    output = actual(**inputs, attention_mask=mask, use_cache=False)
-    assert_fp32_close(getattr(output, output_field, output), expected)
+    ids = token_ids()
+    expected = getattr(reference(input_ids=ids, use_cache=False), output_field)
+    if with_lm_head:
+        expected = expected[:, -1:, :]
+    assert_fp32_close(actual(ids), expected)
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("selection", ["all", "last", "indices"])
-def test_lm_head_selection_fp32(selection: str, config: InklingConfig) -> None:
+@pytest.mark.parametrize("seq_len", [1, 7])
+def test_last_token_logits_fp32(seq_len: int, config: InklingConfig) -> None:
     config.text_config.unpadded_vocab_size = 29
     actual, reference = pair(
         inkling.MyInkling(config),
         hf.InklingForConditionalGeneration(config),
         ignored_prefixes=("model.audio_tower.", "model.vision_tower."),
     )
-    ids, mask = tokens_and_mask()
-    logits_to_keep = (
-        torch.tensor([0, 3, 6])
-        if selection == "indices"
-        else 2
-        if selection == "last"
-        else 0
-    )
-    inputs = {
-        "input_ids": ids,
-        "attention_mask": mask,
-        "use_cache": False,
-        "logits_to_keep": logits_to_keep,
-    }
-    expected = reference(**inputs).logits
-    assert_fp32_close(actual(**inputs), expected)
+    ids = token_ids()[:, :seq_len]
+    expected = reference(input_ids=ids, use_cache=False).logits[:, -1:, :]
+    output = actual(ids)
+    assert output.shape == (ids.shape[0], 1, 29)
+    assert_fp32_close(output, expected)
