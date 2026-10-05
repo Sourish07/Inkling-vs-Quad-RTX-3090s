@@ -20,7 +20,8 @@ class OffloadedExperts(nn.Module):
     Drop-in replacement for `MyInklingExperts` with an LRU expert cache in VRAM
     - Keep resident GPU experts and cache CPU experts in `num_slots` slots.
     - Expects weights already sharded with EP with replicated inputs.
-    - Assumes mixed CPU/GPU storage and enough cache slots for all routed CPU experts.
+    - Assumes mixed CPU/GPU storage and enough cache slots for one token's CPU experts.
+    - Prefill groups CPU experts to fit the cache.
     - NVFP4 checkpoint: layer 2 is BF16; all other expert layers are quantized.
 
     Example weights dict format:
@@ -48,12 +49,13 @@ class OffloadedExperts(nn.Module):
         self.device_mesh = device_mesh
         self.weights = weights
         self.quantized = layer_idx != 2
+
         suffixes = ("", "_scale", "_scale2") if self.quantized else ("",)
-        self.weight_names = [
-            projection + suffix
+        self.projection_names = [
+            [projection + suffix for suffix in suffixes]
             for projection in ("gate_up_proj", "down_proj")
-            for suffix in suffixes
         ]
+        self.weight_names = [name for names in self.projection_names for name in names]
 
         # stores which experts are GPU pinned or in CPU memory
         self.cpu_expert_ids = {
@@ -81,6 +83,7 @@ class OffloadedExperts(nn.Module):
             )
 
         self.copy_stream = torch.cuda.Stream(device)
+        self.copy_events = (torch.cuda.Event(), torch.cuda.Event())
 
         # expert index -> slot, ordered from least to most recently used
         # we pop and then reinsert each time an expert is hit to update "lru"
@@ -97,7 +100,7 @@ class OffloadedExperts(nn.Module):
             self.act_fn,
         )
 
-    def _load(self, expert_id: int) -> int:
+    def _allocate_slot(self, expert_id: int) -> int:
         """
         Called on experts that aren't in cache
         """
@@ -107,29 +110,38 @@ class OffloadedExperts(nn.Module):
             _, slot = self.lru_slots.popitem(last=False)  # LRU eviction
         self.lru_slots[expert_id] = slot  # assigning new expert to slot
 
-        # Initiate copy of 6 weights (2 if unquantized) on copy stream
-        with torch.cuda.stream(self.copy_stream):
-            for name in self.weight_names:
-                getattr(self, "cache_" + name)[slot].copy_(
-                    self.weights[name][expert_id], non_blocking=True
-                )
         return slot
 
-    def prefetch(self, expert_ids: list[int]) -> None:
+    def prefetch(self, expert_ids: list[int]) -> tuple[torch.cuda.Event, ...]:
         """
-        Prefetch only recieves expert ids that aren't already pinned in GPU VRAM.
+        Prepare routing pointers, then copy gate/up weights before down weights.
         """
-        missing = []  # Stores which experts aren't in cache
+        missing = []
         for expert_id in expert_ids:
+            if expert_id in self.gpu_expert_ids:
+                continue
             if expert_id in self.lru_slots:
                 self.lru_slots.move_to_end(expert_id)
             else:
                 missing.append(expert_id)
 
+        slots = {e: self._allocate_slot(e) for e in missing}
+        # Queue metadata before weight copies so it cannot wait behind down copies.
+        self.grouped.set_weights({e: self.tensors(e) for e in expert_ids})
+        if not missing:
+            return ()
+
         # Wait for the previous forward before overwriting cache slots.
         self.copy_stream.wait_stream(torch.cuda.current_stream())
-        for expert_id in missing:
-            self._load(expert_id)
+        with torch.cuda.stream(self.copy_stream):
+            for names, event in zip(self.projection_names, self.copy_events):
+                for expert_id, slot in slots.items():
+                    for name in names:
+                        getattr(self, "cache_" + name)[slot].copy_(
+                            self.weights[name][expert_id], non_blocking=True
+                        )
+                event.record()
+        return self.copy_events
 
     def tensors(self, expert_id: int) -> list[T]:
         """
@@ -151,12 +163,25 @@ class OffloadedExperts(nn.Module):
         expert_ids = [
             e for e in torch.unique(top_k_index).tolist() if e in self.local_expert_ids
         ]
-        if expert_ids:
-            self.prefetch([e for e in expert_ids if e in self.cpu_expert_ids])
-            torch.cuda.current_stream().wait_stream(self.copy_stream)
-            self.grouped.set_weights({e: self.tensors(e) for e in expert_ids})
+        resident = [e for e in expert_ids if e in self.gpu_expert_ids]
+        cold = [e for e in expert_ids if e in self.cpu_expert_ids]
+
+        # Prefill can select more distinct experts than a single decode token.
+        groups = [resident + cold[: self.num_slots]]
+        groups.extend(
+            cold[start : start + self.num_slots]
+            for start in range(self.num_slots, len(cold), self.num_slots)
+        )
+        for group in groups:
+            if not group:
+                continue
+            ready_events = self.prefetch(group)
             self.grouped.forward(
-                hidden_states, top_k_index, top_k_weights, final_hidden_states
+                hidden_states,
+                top_k_index,
+                top_k_weights,
+                final_hidden_states,
+                ready_events,
             )
         torch.distributed.all_reduce(
             final_hidden_states, group=self.device_mesh.get_group()

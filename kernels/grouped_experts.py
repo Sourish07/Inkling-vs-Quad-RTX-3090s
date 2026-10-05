@@ -211,7 +211,7 @@ class GroupedExperts:
         self.activated = torch.empty((self.capacity, self.intermediate_dim), **options)
         self.down = torch.empty((self.capacity, self.hidden_dim), **options)
 
-    def forward(self, x, indices, weights, output):
+    def forward(self, x, indices, weights, output, ready_events):
         routes = indices.numel()
         self.reserve(routes)
         top_k = indices.shape[1]
@@ -228,6 +228,8 @@ class GroupedExperts:
             (0, x, self.gate_up, 2 * self.intermediate_dim, self.hidden_dim),
             (1, self.activated, self.down, self.hidden_dim, self.intermediate_dim),
         ):
+            if ready_events:
+                torch.cuda.current_stream().wait_event(ready_events[projection])
             _gemm[(triton.cdiv(routes, 16) * triton.cdiv(n, 64), self.group_size)](
                 inputs,
                 self.pointers,
