@@ -405,13 +405,11 @@ class MyInklingShortConv(nn.Module):
         cache: MyInklingCache | None = None,
         residual: Fp[T, "bs s d"] | None = None,
     ) -> Fp[T, "bs s d"]:
-        if (
-            hidden_states.is_cuda
-            and not torch.is_grad_enabled()
-            and cache is not None
-            and hidden_states.shape[:2] == (1, 1)
-            and cache.has_previous_state(self.layer_idx, self.conv_idx)
+        if cache is not None and cache.has_previous_state(
+            self.layer_idx, self.conv_idx
         ):
+            # Decode: the kernel shifts the cached history in place.
+            assert hidden_states.shape[:2] == (1, 1)
             history = cache.layers[self.layer_idx].conv_caches[self.conv_idx].cache
             return short_conv(hidden_states, self.conv1d.weight, history, residual)
         input_dtype = hidden_states.dtype
@@ -422,26 +420,10 @@ class MyInklingShortConv(nn.Module):
         seq_len = hidden_states.shape[1]
         hidden_states = rearrange(hidden_states, "bs s d -> bs d s")
 
-        use_cache = cache is not None
-        is_decode = (
-            use_cache
-            and cache.has_previous_state(self.layer_idx, self.conv_idx)
-            and seq_len == 1
-        )
+        if cache is not None:
+            cache.update_conv_cache(hidden_states, self.layer_idx, self.conv_idx)
 
-        orig_conv_padding = self.conv1d.padding
-        if use_cache:
-            _hidden_states = cache.update_conv_cache(
-                hidden_states, self.layer_idx, self.conv_idx
-            )
-
-        if is_decode:
-            self.conv1d.padding = 0
-            hidden_states = _hidden_states
-
-        # [..., :seq_len] has no affect for decode because padding is 0
         hidden_states = self.conv1d(hidden_states)[..., :seq_len]
-        self.conv1d.padding = orig_conv_padding
 
         hidden_states = rearrange(hidden_states, "bs d s -> bs s d")
         output = (hidden_states + conv_residual).to(input_dtype)

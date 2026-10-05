@@ -1,4 +1,6 @@
-"""Small inference kernels; convolution history is FP32 and decode is batch one."""
+"""
+Small inference kernels; convolution history is FP32 and decode is batch one.
+"""
 
 import torch
 import triton
@@ -16,6 +18,13 @@ def _rms_norm(
     EPS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    """
+    RMS-normalize one row of X over its last dimension and scale it by W.
+
+    Each program finds its row through SHAPE and STRIDES, so transposed heads and
+    slices of the fused projection are read in place with no contiguous copy.
+    The reduction runs in FP32.
+    """
     row = tl.program_id(0)
     remaining = row
     offset = 0
@@ -60,6 +69,13 @@ def _short_conv(
     ADD_RESIDUAL: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    """
+    Convolve one new token with its cached history and add the skip connection.
+
+    The FP32 History is shifted and the token appended in place, so decode needs
+    no separate cache update. ADD_RESIDUAL also adds the decoder residual in the
+    same launch.
+    """
     d = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     current = tl.load(X + d, d < D, 0).to(tl.float32)
     total = tl.full((BLOCK,), 0, tl.float32)
@@ -113,6 +129,13 @@ def _update_kv(
     WINDOW: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    """
+    Copy the new key and value tokens into both caches, starting at START.
+
+    K and V are read through their strides, so the transposed head views need no
+    contiguous copy. A nonzero WINDOW selects the sliding cache: positions wrap
+    and each token is written twice, WINDOW apart.
+    """
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     channel = i % D
     token = i // D % S

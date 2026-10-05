@@ -101,7 +101,7 @@ def main(
     # Step 0 is prefill (+ first token); the decode clock starts after it.
     decode_start = 0.0
     num_decode_tokens = 0
-    cache = MyInklingCache(config.text_config, device=device)
+    cache = MyInklingCache(config.text_config)
 
     # ENABLE_PROFILING=1 also enables it; only rank 0 records a trace.
     profiler = Profiler(enable=profile)
