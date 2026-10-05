@@ -11,6 +11,7 @@ dependencies = [
     "huggingface-hub>=1.21.0",
     "jaxtyping>=0.3.10",
     "loguru>=0.7.3",
+    "ninja>=1.13.0",
     "nvidia-modelopt>=0.47.0",
     "requests>=2.34.2",
     "torch>=2.13.0",
