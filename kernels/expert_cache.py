@@ -1,4 +1,6 @@
-"""GPU cache planning and onload from CUDA-mapped pinned checkpoint tensors."""
+"""
+GPU cache planning and onload from CUDA-mapped pinned checkpoint tensors.
+"""
 
 import ctypes
 
@@ -8,7 +10,9 @@ import triton.language as tl
 
 
 def mapped_pointer(tensor):
-    """Resolve pinned host storage once; its owning tensor must remain alive."""
+    """
+    Resolve pinned host storage once; its owning tensor must remain alive.
+    """
     if tensor.is_cuda:
         return tensor.data_ptr()
     assert tensor.is_pinned() and tensor.is_contiguous()
@@ -141,7 +145,9 @@ def _copy(
 
 
 class ExpertCache:
-    """Contiguous EP shard; fixed GPU residents, LRU slots, sequential forwards."""
+    """
+    Contiguous EP shard; fixed GPU residents, LRU slots, sequential forwards.
+    """
 
     def __init__(self, weights, names, num_slots, grouped):
         self.weights = weights  # Keep mapped host allocations alive.
