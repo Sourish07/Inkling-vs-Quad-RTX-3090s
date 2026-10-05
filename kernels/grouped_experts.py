@@ -8,26 +8,6 @@ import triton.language as tl
 
 
 @triton.jit
-def _route(
-    Indices,
-    Experts,
-    Rows,
-    Counts,
-    ROUTES: tl.constexpr,
-    CAPACITY: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    group = tl.program_id(0)
-    expert = tl.load(Experts + group)
-    routes = tl.arange(0, BLOCK)
-    indices = tl.load(Indices + routes, routes < ROUTES, -1)
-    matches = (routes < ROUTES) & (indices == expert)
-    positions = tl.cumsum(matches.to(tl.int32)) - 1
-    tl.store(Rows + group * CAPACITY + positions, routes, matches)
-    tl.store(Counts + group, tl.sum(matches.to(tl.int32)))
-
-
-@triton.jit
 def _gemm(
     X,
     Pointers,
@@ -170,33 +150,15 @@ class GroupedExperts:
         self.device = device
         self.quantized = quantized
         self.act_fn = act_fn
-        # Copy active expert IDs and their pointer table together.
         self.pointer_stride = 6 if quantized else 2
-        pointer_size = (self.max_expert + 1) * self.pointer_stride
-        self.host_metadata = torch.zeros(
-            pointer_size + len(expert_ids), dtype=torch.int64, pin_memory=True
+        self.pointers = torch.zeros(
+            (self.max_expert + 1) * self.pointer_stride,
+            dtype=torch.int64,
+            device=device,
         )
-        self.metadata = torch.empty_like(self.host_metadata, device=device)
-        self.pointer_array = (
-            self.host_metadata[:pointer_size].numpy().reshape(-1, self.pointer_stride)
-        )
-        self.expert_array = self.host_metadata[pointer_size:].numpy()
-        self.pointers = self.metadata[:pointer_size]
-        self.experts = self.metadata[pointer_size:]
-        self.metadata_copied = torch.cuda.Event()
+        self.experts = torch.empty(len(expert_ids), dtype=torch.int32, device=device)
         self.counts = torch.empty(len(expert_ids), dtype=torch.int32, device=device)
         self.capacity = 0
-
-    def set_weights(self, weights):
-        # The previous async copy must finish before we rewrite pinned memory.
-        self.metadata_copied.synchronize()
-        self.pointer_array[:] = 0
-        self.group_size = len(weights)
-        self.expert_array[: self.group_size] = list(weights)
-        for expert, tensors in weights.items():
-            self.pointer_array[expert] = [w.data_ptr() for w in tensors]
-        self.metadata.copy_(self.host_metadata, non_blocking=True)
-        self.metadata_copied.record()
 
     def reserve(self, routes):
         if routes <= self.capacity:
@@ -212,27 +174,15 @@ class GroupedExperts:
         self.activated = torch.empty((self.capacity, self.intermediate_dim), **options)
         self.down = torch.empty((self.capacity, self.hidden_dim), **options)
 
-    def forward(self, x, indices, weights, output, ready_events):
+    def forward(self, x, indices, weights, output):
         routes = indices.numel()
         self.reserve(routes)
         top_k = indices.shape[1]
-        _route[(self.group_size,)](
-            indices,
-            self.experts,
-            self.rows,
-            self.counts,
-            routes,
-            self.capacity,
-            triton.next_power_of_2(routes),
-        )
         for projection, inputs, target, n, k in (
             (0, x, self.gate_up, 2 * self.intermediate_dim, self.hidden_dim),
             (1, self.activated, self.down, self.hidden_dim, self.intermediate_dim),
         ):
-            if ready_events:
-                torch.cuda.current_stream().wait_event(ready_events[projection])
-
-            # self.group_size is number of routed_experts! (it's just part of launch grid)
+            # The GPU planner compacts active groups; unused groups have count zero.
             _gemm[(triton.cdiv(routes, 16) * triton.cdiv(n, 64), self.group_size)](
                 inputs,
                 self.pointers,

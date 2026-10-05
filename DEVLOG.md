@@ -85,3 +85,5 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 - The reused buffers are `self.host_metadata`, `self.metadata`, 
 (the views into them), and then `self.counts`
   - also the ones created in `reserve()`
+
+## 8. GPU routing and expert cache decisions
