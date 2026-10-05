@@ -39,7 +39,8 @@ from utils.checkpointing import (
     load_config,
     load_non_expert_state_dict,
 )
-from utils.dist import Timer, get_device_mesh, setup_ddp_local, setup_rank_aware_logger
+from utils.dist import get_device_mesh, setup_ddp_local, setup_rank_aware_logger
+from utils.profiling import Timer
 
 GIB = 1024**3
 DTYPES = {
