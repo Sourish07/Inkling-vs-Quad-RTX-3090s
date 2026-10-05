@@ -97,6 +97,7 @@ def _gemm(
                     0,
                 )
                 # Decode E4M3 in FP32: Ampere has no native FP8 conversion.
+                # NVFP4 scales are E4M3
                 exponent = (bits >> 3) & 15
                 mantissa = bits & 7
                 block_scale = tl.where(
@@ -230,6 +231,8 @@ class GroupedExperts:
         ):
             if ready_events:
                 torch.cuda.current_stream().wait_event(ready_events[projection])
+
+            # self.group_size is number of routed_experts! (it's just part of launch grid)
             _gemm[(triton.cdiv(routes, 16) * triton.cdiv(n, 64), self.group_size)](
                 inputs,
                 self.pointers,
