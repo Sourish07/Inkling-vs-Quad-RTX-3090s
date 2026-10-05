@@ -12,6 +12,6 @@ List of optimizations:
 - 4. Expert Parallelism + CPU offloading (no expert caching)
   - Speed: 2.6 tok/s
 - 5. Expert caching
-  - Speed: 3.4 tok/s
+  - Speed: 3.28 tok/s
  
 Please read [DEVLOG.md](DEVLOG.md) for more details about my journey.
