@@ -2,6 +2,7 @@
 
 ## 1. Porting over Inkling implementation
 
+- Literally my first goal is to get just something running; `transformers` sample code won't work because the model is too large to fit across GPUs or even just within host memory.
 - Used agents to create testing suite to ensure parity with transformers implementation
 - Architecture broadly makes sense. Using jaxtyping & einops makes tensors ops way more readable
 - For now, omitting caching & vision/audio towers

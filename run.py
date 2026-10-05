@@ -53,7 +53,7 @@ assert not unexpected and all(".mlp.experts." in name for name in missing)
 expert_state_dict = load_expert_state_dict(
     model, local_hf_path, device_mesh, gpu_experts_per_rank
 )
-apply_ep_plan(model, device_mesh, expert_state_dict)
+apply_ep_plan(model, device_mesh, expert_state_dict, num_slots=10)
 
 torch.distributed.barrier()
 logger.info(f"Inkling model loaded on device {device}")
