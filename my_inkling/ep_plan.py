@@ -135,8 +135,10 @@ class OffloadedExperts(nn.Module):
                 for suffix in ["_scale", "_scale2"]
             )
         else:
-            slot = self.lru_slots[expert_id]
-            assert slot is not None
+            slot = self.lru_slots.get(expert_id)
+            if slot is None:
+                self.copy_stream.wait_stream(torch.cuda.current_stream())
+                slot = self._load(expert_id)
 
             if slot in self.pending:
                 # self.pending[slot] = {gate_up_proj: Event, down_proj: Event}
