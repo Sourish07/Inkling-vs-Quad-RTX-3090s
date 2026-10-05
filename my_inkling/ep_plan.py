@@ -88,8 +88,8 @@ class OffloadedExperts(nn.Module):
         if len(self.lru_slots) < self.num_slots:
             slot = len(self.lru_slots)
         else:
-            _, slot = self.lru_slots.popitem(last=False) # LRU eviction
-        self.lru_slots[expert_id] = slot # assigning new expert to slot
+            _, slot = self.lru_slots.popitem(last=False)  # LRU eviction
+        self.lru_slots[expert_id] = slot  # assigning new expert to slot
 
         # Initiate copy of 6 weights on copy stream
         copied = {}
@@ -109,7 +109,7 @@ class OffloadedExperts(nn.Module):
         """
         Prefetch only recieves expert ids that aren't already pinned in GPU VRAM.
         """
-        missing = [] # Stores which experts aren't in cache
+        missing = []  # Stores which experts aren't in cache
         for expert_id in expert_ids:
             if expert_id in self.lru_slots:
                 self.lru_slots.move_to_end(expert_id)
@@ -118,37 +118,42 @@ class OffloadedExperts(nn.Module):
 
         # Since copy stream & compute stream operate independently, we don't want to enqueue copies
         # that may override slots a GEMM in compute stream requires
-        # Technically not necessary due to other sync points in model
+        # Technically not necessary due to other sync points in model (which we'll remove eventually)
         self.copy_stream.wait_stream(torch.cuda.current_stream())
         for expert_id in missing:
             self._load(expert_id)
 
     def matrix(self, projection: str, expert_id: int, like: T) -> T:
         """
-        Returns the weight matrix for the given projection and expert ID, converted to the
-        same device and dtype as `like`.
+        Returns the weight matrix for the given projection and expert ID,
+        converted to the same device and dtype as `like`.
         """
-        slot = self.lru_slots.get(expert_id)
-        if slot is not None and slot in self.pending:
-            # self.pending[slot] = {gate_up_proj: Event, down_proj: Event}
-            torch.cuda.current_stream().wait_event(self.pending[slot].pop(projection))
+        if expert_id in self.gpu_expert_ids:
+            weight = self.weights[projection][expert_id]
+            scale, scale2 = (
+                self.weights[projection + suffix][expert_id]
+                for suffix in ["_scale", "_scale2"]
+            )
+        else:
+            slot = self.lru_slots[expert_id]
+            assert slot is not None
 
-            # Remove the slot when both projections are done
-            if not self.pending[slot]:
-                del self.pending[slot]
+            if slot in self.pending:
+                # self.pending[slot] = {gate_up_proj: Event, down_proj: Event}
+                torch.cuda.current_stream().wait_event(
+                    self.pending[slot].pop(projection)
+                )
 
-        # slot is None means it's a GPU pinned expert
-        weight = (
-            self.weights[projection][expert_id].to(like.device)
-            if slot is None
-            else getattr(self, "cache_" + projection)[slot]
-        )
-        scale, scale2 = (
-            self.weights[projection + suffix][expert_id].to(like.device)
-            if slot is None
-            else getattr(self, "cache_" + projection + suffix)[slot]
-            for suffix in ("_scale", "_scale2")
-        )
+                # Remove the slot when both projections are done
+                if not self.pending[slot]:
+                    del self.pending[slot]
+
+            weight = getattr(self, "cache_" + projection)[slot]
+            scale, scale2 = (
+                getattr(self, "cache_" + projection + suffix)[slot]
+                for suffix in ("_scale", "_scale2")
+            )
+
         shape = torch.Size((*weight.shape[:-1], weight.shape[-1] * 2))
         return NVFP4QTensor(shape, like.dtype, weight).dequantize(
             dtype=like.dtype,
@@ -167,9 +172,7 @@ class OffloadedExperts(nn.Module):
         final_hidden_states = torch.zeros_like(hidden_states, dtype=torch.float32)
 
         expert_ids = [
-            e
-            for e in torch.unique(top_k_index).tolist()
-            if e in self.local_expert_ids
+            e for e in torch.unique(top_k_index).tolist() if e in self.local_expert_ids
         ]
 
         # prefetch only non-gpu pinned experts
