@@ -4,8 +4,6 @@ Run four GPUs with ``torchrun --standalone --nproc-per-node=4 -m scripts.run_nai
 """
 
 import json
-import os
-import sys
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -16,7 +14,6 @@ import torch
 import torch.distributed as dist
 import tyro
 from accelerate import (
-    PartialState,
     cpu_offload,
     infer_auto_device_map,
     init_empty_weights,
@@ -25,11 +22,11 @@ from accelerate.utils import set_module_tensor_to_device
 from huggingface_hub import parse_local_safetensors_file_metadata, snapshot_download
 from jaxtyping import Float as Fp
 from jaxtyping import Int, Shaped, UInt8
+from loguru import logger
 from modelopt.torch.quantization.qtensor import NVFP4QTensor
 from safetensors import safe_open
 from torch import Tensor as T
 from torch import nn
-from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
 from torch.nn import functional as F
 from transformers import AutoConfig, AutoTokenizer
@@ -39,6 +36,7 @@ from my_inkling.cache import MyInklingCache
 from my_inkling.model import MyInklingMoE
 from my_inkling.tp_plan import apply_tp_plan
 from utils.checkpointing import convert_checkpoint_tensors, load_non_expert_state_dict
+from utils.dist import Timer, get_device_mesh, setup_ddp_local, setup_rank_aware_logger
 
 GIB = 1024**3
 DTYPES = {
@@ -329,10 +327,11 @@ def generate(model, input_ids, *, max_new_tokens, eos_token_ids):
         input_ids = token.to(input_ids.device)
         token_id = token.item()
         if dist.get_rank() == 0:
-            print(
-                f"Token {step + 1}: id={token_id}, {time.monotonic() - started:.2f}s",
-                file=sys.stderr,
-                flush=True,
+            logger.info(
+                "Token {}: id={}, {:.2f}s",
+                step + 1,
+                token_id,
+                time.monotonic() - started,
             )
         yield token_id
         if token_id in eos_token_ids:
@@ -343,7 +342,6 @@ def main(
     checkpoint: str = "thinkingmachines/Inkling-Small-NVFP4",
     prompt: str = "What is 17 * 23?",
     max_new_tokens: int = 8,
-    gpus: str = "0,1,2,3",
     gpu_gib: float = 20,
     cpu_gib: float = 100,
     cpu_load_workers: int = 16,
@@ -357,7 +355,6 @@ def main(
         checkpoint: Local checkpoint directory or HF model ID (reuses the HF cache).
         prompt: User message; thinking effort is disabled.
         max_new_tokens: Maximum output tokens.
-        gpus: Visible GPU IDs; launch one torchrun process per GPU. Empty string uses CPU.
         gpu_gib: Weight budget per GPU in GiB; leave room for decoding and activations.
         cpu_gib: CPU weight budget in GiB; capped by available RAM minus 8 GiB.
         cpu_load_workers: Concurrent CPU expert copies during loading; 1 uses serial copies.
@@ -366,18 +363,10 @@ def main(
         skip_checkpoint_loading: Allocate placeholder weights for the configured model
             instead of reading checkpoint tensors; config, headers, and tokenizer are still used.
     """
-    os.environ["CUDA_VISIBLE_DEVICES"] = gpus
-    distributed = PartialState(cpu=not gpus)
-    if gpus and distributed.num_processes != len(gpus.split(",")):
-        raise ValueError(
-            "Launch with torchrun --standalone --nproc-per-node=<number of GPUs>"
-        )
-    if not dist.is_initialized():
-        dist.init_process_group(
-            "nccl" if gpus else "gloo", store=dist.HashStore(), rank=0, world_size=1
-        )
-    device = torch.device(distributed.device)
-    mesh = init_device_mesh(device.type, (distributed.num_processes,))
+    device, _ = setup_ddp_local()
+    mesh = get_device_mesh()
+    setup_rank_aware_logger()
+    is_main_process = dist.get_rank() == 0
     path = (
         Path(checkpoint)
         if Path(checkpoint).is_dir()
@@ -399,9 +388,9 @@ def main(
     model = build_model(config, raw_tensors)
     apply_tp_plan(model, config, mesh)
     device_map = expert_placements(model, mesh, gpu_gib, cpu_gib)
-    if distributed.is_main_process:
+    if is_main_process:
         for name, storage in device_map.items():
-            print(f"{name}: {storage}", file=sys.stderr)
+            logger.info("{}: {}", name, storage)
     if plan:
         dist.destroy_process_group()
         return
@@ -419,23 +408,19 @@ def main(
     if input_ids.shape[-1] + max_new_tokens > max_sequence_length:
         raise ValueError("Prompt + generation exceeds max_sequence_length")
     input_ids = input_ids.to(device)
-    started = time.monotonic()
-    model = load_weights(
-        model,
-        path,
-        files,
-        raw_tensors,
-        device_map,
-        mesh,
-        skip_checkpoint_loading=skip_checkpoint_loading,
-        cpu_load_workers=cpu_load_workers,
-    )
-    if distributed.is_main_process:
-        print(
-            f"Loaded in {time.monotonic() - started:.2f}s; prompt: {input_ids.shape[-1]} tokens",
-            file=sys.stderr,
-            flush=True,
+    with Timer("Checkpoint loading"):
+        model = load_weights(
+            model,
+            path,
+            files,
+            raw_tensors,
+            device_map,
+            mesh,
+            skip_checkpoint_loading=skip_checkpoint_loading,
+            cpu_load_workers=cpu_load_workers,
         )
+    if is_main_process:
+        logger.info("Prompt: {} tokens", input_ids.shape[-1])
     eos = tokenizer.eos_token_id
     started = time.monotonic()
     tokens = list(
@@ -447,10 +432,12 @@ def main(
         )
     )
     elapsed = time.monotonic() - started
-    if distributed.is_main_process:
-        print(
-            f"Generated {len(tokens)} tokens in {elapsed:.2f}s ({len(tokens) / elapsed:.4f} tokens/s, excluding loading)",
-            file=sys.stderr,
+    if is_main_process:
+        logger.info(
+            "Generated {} tokens in {:.2f}s ({:.4f} tokens/s, excluding loading)",
+            len(tokens),
+            elapsed,
+            len(tokens) / elapsed,
         )
         print(tokenizer.decode(tokens, skip_special_tokens=False))
     dist.destroy_process_group()
