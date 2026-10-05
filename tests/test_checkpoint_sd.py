@@ -9,7 +9,7 @@ from huggingface_hub.utils import SafetensorsFileMetadata
 from transformers import AutoConfig
 
 from my_inkling import MyInkling
-from utils.checkpointing import convert_checkpoint_shapes
+from utils import convert_checkpoint_shapes
 
 
 def test_checkpoint_state_dict() -> None:

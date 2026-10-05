@@ -30,17 +30,16 @@ from torch.distributed.tensor import DTensor
 from torch.nn import functional as F
 from transformers import AutoTokenizer
 
-from my_inkling import MyInkling
-from my_inkling.cache import MyInklingCache
-from my_inkling.model import MyInklingMoE
-from my_inkling.tp_plan import apply_tp_plan
-from utils.checkpointing import (
+from my_inkling import MyInkling, MyInklingCache, MyInklingMoE, apply_tp_plan
+from utils import (
+    Timer,
     convert_checkpoint_tensors,
+    get_device_mesh,
     load_config,
     load_non_expert_state_dict,
+    setup_ddp_local,
+    setup_rank_aware_logger,
 )
-from utils.dist import get_device_mesh, setup_ddp_local, setup_rank_aware_logger
-from utils.profiling import Timer
 
 GIB = 1024**3
 DTYPES = {

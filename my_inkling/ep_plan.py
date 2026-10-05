@@ -7,7 +7,7 @@ from torch import Tensor as T
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
-from kernels.grouped_experts import GroupedExperts
+from kernels import GroupedExperts
 
 from .model import (
     MyInkling,
