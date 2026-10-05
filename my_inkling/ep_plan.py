@@ -208,6 +208,9 @@ def apply_ep_plan(
 ) -> MyInkling:
     for name, module in list(model.named_modules()):
         if isinstance(module, MyInklingExperts):
+            # Isolate just the 6 weight banks (proj, scale, scale2) * (gate_up, down) for this layer
+            # the "per-expert" dictionaries (ex. {0: packed_tensor, 1: packed_tensor}) are
+            # prebuilt from checkpoint loader
             weights = {
                 key.removeprefix(f"{name}."): bank
                 for key, bank in expert_state_dict.items()
