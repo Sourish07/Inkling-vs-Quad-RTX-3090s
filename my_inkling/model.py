@@ -1,9 +1,10 @@
+import math
 from dataclasses import dataclass
 
 import torch
 from einops import rearrange, repeat
-from jaxtyping import Bool, Int
 from jaxtyping import Float as Fp
+from jaxtyping import Int
 from torch import Tensor as T
 from torch import nn
 from torch.nn import functional as F
@@ -111,17 +112,12 @@ class MyInklingRelativeLogits(nn.Module):
     def forward(
         self,
         relative_states: Fp[T, "bs s h r"],
-        query_positions: Int[T, " s"],
-        key_positions: Int[T, " k_len"],
+        distance: Int[T, "s k_len"],
     ) -> Fp[T, "bs h s k_len"]:
         rel_logits = rearrange(
             relative_states @ self.proj,
             "bs s h rel_extent -> bs h s rel_extent",
         )
-
-        distance: Int[T, "s k_len"] = rearrange(
-            query_positions, "s -> s 1"
-        ) - rearrange(key_positions, "k_len -> 1 k_len")
 
         gather_index = repeat(
             distance.clamp(0, self.rel_extent - 1),
@@ -498,40 +494,43 @@ class MyInklingAttention(nn.Module):
 
         self.rel_logits_proj = MyInklingRelativeLogits(config.d_rel, self.rel_extent)
 
+    @torch.no_grad()
+    def fuse_projections(self) -> None:
+        """Pack this rank's loaded Q/K/V/relative weights once for inference.
+
+        Load checkpoint weights and apply TP before calling this method.
+        """
+        projections = [self.q_proj, self.k_proj, self.v_proj, self.r_proj]
+        self.projection_sizes = [projection.out_features for projection in projections]
+        weight = torch.cat([projection.weight for projection in projections])
+        self.qkvr_proj = nn.Linear(
+            weight.shape[1], weight.shape[0], bias=False, device="meta"
+        )
+        self.qkvr_proj.weight = nn.Parameter(weight, requires_grad=False)
+        del self.q_proj, self.k_proj, self.v_proj, self.r_proj
+
     def forward(
         self,
         hidden_states: Fp[T, "bs s d"],
         cache: MyInklingCache | None = None,
     ) -> Fp[T, "bs s d"]:
         """Return SDPA output without materializing attention probabilities."""
-        _q_proj = self.q_proj(hidden_states)
-        q_proj = rearrange(
-            _q_proj, "bs s (h c) -> bs h s c", h=self.num_heads, c=self.head_dim
+        bs, q_len, _ = hidden_states.shape
+        q, k, v, r = self.qkvr_proj(hidden_states).split(self.projection_sizes, dim=-1)
+        query_states = self.q_norm(
+            q.view(bs, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         )
-        query_states: Fp[T, "bs h s c"] = self.q_norm(q_proj)
-
-        key_projection: Fp[T, "bs s hk_c"] = self.k_sconv(
-            self.k_proj(hidden_states), cache=cache
+        key_states: Fp[T, "bs hk k_len c"] = self.k_norm(
+            self.k_sconv(k, cache=cache)  #  Fp[T, "bs s hk_c"]
+            .view(bs, q_len, self.num_key_value_heads, self.head_dim)
+            .transpose(1, 2)
         )
-        value_projection: Fp[T, "bs s hk_c"] = self.v_sconv(
-            self.v_proj(hidden_states), cache=cache
-        )
-
-        _key_states = rearrange(
-            key_projection,
-            "bs s (hk c) -> bs hk s c",
-            hk=self.num_key_value_heads,
-            c=self.head_dim,
-        )
-        key_states: Fp[T, "bs hk k_len c"] = self.k_norm(_key_states)
-        value_states: Fp[T, "bs hk k_len c"] = rearrange(
-            value_projection,
-            "bs s (hk c) -> bs hk s c",
-            hk=self.num_key_value_heads,
-            c=self.head_dim,
+        value_states: Fp[T, "bs hk k_len c"] = (
+            self.v_sconv(v, cache=cache)  # Fp[T, "bs s hk_c"]
+            .view(bs, q_len, self.num_key_value_heads, self.head_dim)
+            .transpose(1, 2)
         )
 
-        q_len = query_states.shape[2]
         query_start = 0
 
         if cache is not None:
@@ -540,48 +539,50 @@ class MyInklingAttention(nn.Module):
                 key_states, value_states, self.layer_idx
             )
 
-        relative_states: Fp[T, "bs s h r"] = rearrange(
-            self.r_proj(hidden_states),
-            "bs s (h r) -> bs s h r",
-            h=self.num_heads,
-        )
+        relative_states: Fp[T, "bs s h r"] = r.view(bs, q_len, self.num_heads, -1)
 
         kv_len = key_states.shape[2]
-        tokens_seen_after_update = query_start + q_len
-        key_start = tokens_seen_after_update - kv_len
-
-        q_positions: Int[T, " s"] = (
-            torch.arange(q_len, device=hidden_states.device) + query_start
-        )
-        kv_positions: Int[T, " k_len"] = (
-            torch.arange(kv_len, device=hidden_states.device) + key_start
-        )
-        position_bias: Fp[T, "bs h s k_len"] = self.rel_logits_proj(
-            relative_states, q_positions, kv_positions
-        )
+        if q_len == 1:
+            # Cached keys end at this query; all are causal and within the SWA window.
+            logits = relative_states @ self.rel_logits_proj.proj
+            position_bias = logits.transpose(1, 2)[..., :kv_len].flip(-1)
+            if kv_len > self.rel_extent:
+                position_bias = F.pad(position_bias, (kv_len - self.rel_extent, 0))
+            sdpa_mask = position_bias
+        else:
+            # Relative distances do not depend on the absolute cache position.
+            distance: Int[T, "s k_len"] = (
+                torch.arange(q_len, device=hidden_states.device)[:, None]
+                + kv_len
+                - q_len
+                - torch.arange(kv_len, device=hidden_states.device)[None, :]
+            )
+            position_bias = self.rel_logits_proj(relative_states, distance)
+            allowed = distance >= 0
+            if self.sliding_window is not None:
+                allowed &= distance < self.sliding_window
+            sdpa_mask = position_bias.masked_fill(~allowed, float("-inf"))
 
         # Inkling scales both content scores and relative bias in full attention.
-        if not self.is_sliding and self.log_scaling_n_floor is not None:
-            effective_n: Fp[T, " s"] = (q_positions + 1).float()
-
-            _tau = 1.0 + self.log_scaling_alpha * torch.log(
-                (effective_n / self.log_scaling_n_floor).clamp(min=1.0)
-            )
-            tau: Fp[T, "1 1 s 1"] = rearrange(_tau, "s -> 1 1 s 1")
-
+        if (
+            not self.is_sliding
+            and self.log_scaling_n_floor is not None
+            and query_start + q_len > self.log_scaling_n_floor
+        ):
+            if q_len == 1:
+                tau = 1.0 + self.log_scaling_alpha * math.log(
+                    (query_start + 1) / self.log_scaling_n_floor
+                )
+            else:
+                effective_n = (
+                    torch.arange(q_len, device=hidden_states.device) + query_start + 1
+                ).float()
+                tau = 1.0 + self.log_scaling_alpha * torch.log(
+                    (effective_n / self.log_scaling_n_floor).clamp(min=1.0)
+                )
+                tau = tau.view(1, 1, q_len, 1)
             query_states = (query_states.float() * tau).to(query_states.dtype)
-            position_bias = (position_bias.float() * tau).to(position_bias.dtype)
-
-        # Combine relative bias with causal and sliding-window restrictions.
-        distance: Int[T, "s k_len"] = rearrange(q_positions, "s -> s 1") - rearrange(
-            kv_positions, "k_len -> 1 k_len"
-        )
-        allowed: Bool[T, "s k_len"] = distance >= 0
-        if self.sliding_window is not None:
-            allowed = allowed & (distance < self.sliding_window)
-        sdpa_mask: Fp[T, "bs h s k_len"] = position_bias.masked_fill(
-            ~allowed, float("-inf")
-        )
+            sdpa_mask = (sdpa_mask.float() * tau).to(sdpa_mask.dtype)
 
         attn_output: Fp[T, "bs h s c"] = F.scaled_dot_product_attention(
             query_states,
@@ -715,6 +716,12 @@ class MyInkling(nn.Module):
                 module.conv1d.float()
             elif isinstance(module, MyInklingTopkRouter):
                 module.e_score_correction_bias = module.e_score_correction_bias.float()
+
+    def fuse_attention_projections(self) -> None:
+        """Finalize attention for inference after loading the local TP shards."""
+        for module in self.modules():
+            if isinstance(module, MyInklingAttention):
+                module.fuse_projections()
 
     def forward(
         self, input_ids: Int[T, "bs s"], cache: MyInklingCache | None = None

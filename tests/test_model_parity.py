@@ -19,6 +19,7 @@ from transformers.models.inkling.configuration_inkling import (
 
 from my_inkling import MyInkling
 from my_inkling import model as inkling
+from my_inkling.cache import MyInklingCache
 
 
 @pytest.fixture(autouse=True)
@@ -135,6 +136,9 @@ def pair[ActualModule: nn.Module, ReferenceModule: nn.Module](
             assert tensor.device.type == "cpu"
             if tensor.is_floating_point():
                 assert tensor.dtype == torch.float32
+    for module in actual.modules():
+        if isinstance(module, inkling.MyInklingAttention):
+            module.fuse_projections()
     return actual, reference
 
 
@@ -179,7 +183,7 @@ def test_relative_logits_fp32(
     queries = torch.arange(7) + query_offset
     keys = torch.arange(12)
     expected = reference(states, queries, keys)
-    assert_fp32_close(actual(states, queries, keys), expected)
+    assert_fp32_close(actual(states, queries[:, None] - keys[None, :]), expected)
 
 
 @torch.no_grad()
@@ -285,6 +289,31 @@ def test_attention_fp32(layer_idx: int, text_config: InklingTextConfig) -> None:
     mask = attention_mask(text_config, layer_idx)
     expected, _ = reference(states, attention_mask=mask)
     assert_fp32_close(actual(states), expected)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("layer_idx", [0, 1], ids=["full", "sliding"])
+def test_attention_cached_fp32(layer_idx: int, text_config: InklingTextConfig) -> None:
+    """Decode through SWA rollover and past the learned relative-bias extent."""
+    actual, reference = pair(
+        inkling.MyInklingAttention(text_config, layer_idx),
+        hf.InklingAttention(text_config, layer_idx),
+    )
+    states = torch.randn(1, 10, text_config.hidden_size)
+    positions = torch.arange(states.shape[1])
+    distance = positions[:, None] - positions[None, :]
+    allowed = distance >= 0
+    if layer_idx == 1:
+        allowed &= distance < text_config.sliding_window_size
+    mask = torch.zeros(1, 1, 10, 10).masked_fill(~allowed, float("-inf"))
+    expected, _ = reference(states, attention_mask=mask)
+    cache = MyInklingCache(text_config)
+    chunks = [2] + [1] * 8
+    start = 0
+    for size in chunks:
+        end = start + size
+        assert_fp32_close(actual(states[:, start:end], cache), expected[:, start:end])
+        start = end
 
 
 @torch.no_grad()

@@ -117,3 +117,12 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
   - Doesn't use VRAM until GPU accesses pointer
   - `.data_ptr()` will return the GPU virtual address, regardless of if it's actually in VRAM or host memory
   - When copying, there's no intermediate staging buffer (ex. because non-pinned memory may be on disk)
+
+## 9. Fusing Q/K/V/relative projections and simplifying attention preparation
+
+- Fusing the four projections (Q/K/V/relative) into a single kernel before attention
+- Relative distance calculations only happen once
+  - Used to happen in `MyInklingRelativeLogits.forward` and `MyInklingAttention.forward` when creating the causal/sliding mask
+- Skipping log scaling when it's a no-op (tau == 1 until the sequence passes log_scaling_n_floor)
+  - Separated out single token case too
+- Running at ~11.22 tok/s

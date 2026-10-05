@@ -19,5 +19,7 @@ List of optimizations:
   - Speed: 9.45 tok/s
 - 8. Moving rest of hot path to GPU
   - Speed: 9.88 tok/s
+- 9. Fusing Q/K/V/relative projections and simplifying attention preparation
+  - Speed: 11.22 tok/s
  
 Please read [DEVLOG.md](DEVLOG.md) for more details about my journey.

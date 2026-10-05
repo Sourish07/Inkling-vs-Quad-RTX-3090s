@@ -65,6 +65,8 @@ def main(
         non_expert_state_dict, strict=False, assign=True
     )
     assert not unexpected and all(".mlp.experts." in name for name in missing)
+    del non_expert_state_dict
+    model.fuse_attention_projections()
 
     expert_state_dict = load_expert_state_dict(
         model, local_hf_path, device_mesh, gpu_experts_per_rank
