@@ -1,0 +1,158 @@
+"""Small inference kernels; convolution history is FP32 and decode is batch one."""
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _rms_norm(
+    X,
+    W,
+    Y,
+    SHAPE: tl.constexpr,
+    STRIDES: tl.constexpr,
+    D: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    remaining = row
+    offset = 0
+    for axis in tl.static_range(len(SHAPE) - 1, -1, -1):
+        offset += (remaining % SHAPE[axis]) * STRIDES[axis]
+        remaining //= SHAPE[axis]
+    d = tl.arange(0, BLOCK)
+    x = tl.load(X + offset + d * STRIDES[-1], d < D, 0).to(tl.float32)
+    scale = tl.rsqrt(tl.sum(x * x, 0) / D + EPS)
+    # PyTorch rounds normalized activations before multiplying by the weight.
+    normalized = (x * scale).to(X.dtype.element_ty).to(tl.float32)
+    weight = tl.load(W + d, d < D, 0).to(tl.float32)
+    tl.store(Y + row * D + d, normalized * weight, d < D)
+
+
+def rms_norm(x, weight, eps):
+    output = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    width = x.shape[-1]
+    _rms_norm[(x.numel() // width,)](
+        x,
+        weight,
+        output,
+        tuple(x.shape[:-1]),
+        tuple(x.stride()),
+        width,
+        eps,
+        triton.next_power_of_2(width),
+        enable_fp_fusion=False,
+    )
+    return output
+
+
+@triton.jit
+def _short_conv(
+    X,
+    W,
+    History,
+    Residual,
+    Y,
+    D: tl.constexpr,
+    K: tl.constexpr,
+    ADD_RESIDUAL: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    d = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    current = tl.load(X + d, d < D, 0).to(tl.float32)
+    total = tl.full((BLOCK,), 0, tl.float32)
+    # A channel belongs to one lane: load each old value before overwriting it.
+    for j in tl.static_range(K - 1):
+        previous = tl.load(History + d * K + j + 1, d < D, 0)
+        weight = tl.load(W + d * K + j, d < D, 0).to(tl.float32)
+        total += previous * weight
+        tl.store(History + d * K + j, previous, d < D)
+    weight = tl.load(W + d * K + K - 1, d < D, 0).to(tl.float32)
+    total += current * weight
+    tl.store(History + d * K + K - 1, current, d < D)
+    output = (total + current).to(Y.dtype.element_ty)
+    if ADD_RESIDUAL:
+        residual = tl.load(Residual + d, d < D, 0).to(tl.float32)
+        output = output.to(tl.float32) + residual
+    tl.store(Y + d, output, d < D)
+
+
+def short_conv(x, weight, history, residual=None):
+    output = torch.empty_like(x)
+    width = x.shape[-1]
+    _short_conv[(triton.cdiv(width, 256),)](
+        x,
+        weight,
+        history,
+        residual if residual is not None else x,
+        output,
+        width,
+        weight.shape[-1],
+        residual is not None,
+        256,
+        enable_fp_fusion=False,
+    )
+    return output
+
+
+@triton.jit
+def _update_kv(
+    K,
+    V,
+    KCache,
+    VCache,
+    HEADS: tl.constexpr,
+    S: tl.constexpr,
+    D: tl.constexpr,
+    K_STRIDES: tl.constexpr,
+    V_STRIDES: tl.constexpr,
+    CAPACITY: tl.constexpr,
+    START,
+    WINDOW: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    channel = i % D
+    token = i // D % S
+    head = i // (D * S)
+    key = tl.load(
+        K + head * K_STRIDES[1] + token * K_STRIDES[2] + channel * K_STRIDES[3],
+        i < HEADS * S * D,
+        0,
+    )
+    value = tl.load(
+        V + head * V_STRIDES[1] + token * V_STRIDES[2] + channel * V_STRIDES[3],
+        i < HEADS * S * D,
+        0,
+    )
+    position = START + token
+    if WINDOW:
+        position %= WINDOW
+    destination = (head * CAPACITY + position) * D + channel
+    tl.store(KCache + destination, key, i < HEADS * S * D)
+    tl.store(VCache + destination, value, i < HEADS * S * D)
+    if WINDOW:
+        # Mirrored ring: the newest window is always a contiguous chronological view.
+        tl.store(KCache + destination + WINDOW * D, key, i < HEADS * S * D)
+        tl.store(VCache + destination + WINDOW * D, value, i < HEADS * S * D)
+
+
+def update_kv(key, value, k_cache, v_cache, start, window=0):
+    assert key.shape[0] == 1
+    _update_kv[(triton.cdiv(key.numel(), 256),)](
+        key,
+        value,
+        k_cache,
+        v_cache,
+        key.shape[1],
+        key.shape[2],
+        key.shape[3],
+        tuple(key.stride()),
+        tuple(value.stride()),
+        k_cache.shape[2],
+        start,
+        window,
+        256,
+    )

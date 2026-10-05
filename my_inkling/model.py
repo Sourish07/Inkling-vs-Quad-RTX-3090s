@@ -10,6 +10,8 @@ from torch import nn
 from torch.nn import functional as F
 from transformers import InklingForConditionalGeneration
 
+from kernels.decode import rms_norm, short_conv
+
 from .cache import MyInklingCache
 
 ACT2FN = {"silu": nn.functional.silu}
@@ -141,6 +143,8 @@ class MyInklingRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
     def forward(self, hidden_states: Fp[T, "*batch d"]) -> Fp[T, "*batch d"]:
+        if hidden_states.is_cuda and not torch.is_grad_enabled():
+            return rms_norm(hidden_states, self.weight, self.variance_epsilon)
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.float()
         variance: Fp[T, "*batch 1"] = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -399,11 +403,21 @@ class MyInklingShortConv(nn.Module):
         self,
         hidden_states: Fp[T, "bs s d"],
         cache: MyInklingCache | None = None,
+        residual: Fp[T, "bs s d"] | None = None,
     ) -> Fp[T, "bs s d"]:
+        if (
+            hidden_states.is_cuda
+            and not torch.is_grad_enabled()
+            and cache is not None
+            and hidden_states.shape[:2] == (1, 1)
+            and cache.has_previous_state(self.layer_idx, self.conv_idx)
+        ):
+            history = cache.layers[self.layer_idx].conv_caches[self.conv_idx].cache
+            return short_conv(hidden_states, self.conv1d.weight, history, residual)
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.float()
 
-        residual = hidden_states
+        conv_residual = hidden_states
 
         seq_len = hidden_states.shape[1]
         hidden_states = rearrange(hidden_states, "bs s d -> bs d s")
@@ -430,7 +444,8 @@ class MyInklingShortConv(nn.Module):
         self.conv1d.padding = orig_conv_padding
 
         hidden_states = rearrange(hidden_states, "bs d s -> bs s d")
-        return (hidden_states + residual).to(input_dtype)
+        output = (hidden_states + conv_residual).to(input_dtype)
+        return output if residual is None else output + residual
 
 
 class MyInklingAttention(nn.Module):
@@ -646,14 +661,12 @@ class MyInklingDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, cache=cache)
-        hidden_states = self.attn_sconv(hidden_states, cache=cache)
-        hidden_states = residual + hidden_states
+        hidden_states = self.attn_sconv(hidden_states, cache=cache, residual=residual)
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = self.mlp_sconv(hidden_states, cache=cache)
-        hidden_states = residual + hidden_states
+        hidden_states = self.mlp_sconv(hidden_states, cache=cache, residual=residual)
         return hidden_states
 
 

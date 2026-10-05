@@ -19,6 +19,8 @@ import torch
 from jaxtyping import Float as Fp
 from torch import Tensor as T
 
+from kernels.decode import update_kv
+
 if TYPE_CHECKING:
     from my_inkling.model import InklingTextConfig
 
@@ -119,8 +121,11 @@ class FullAttentionLayerCache:
         while new_size > self.k_cache.shape[2]:
             self.extend_cache()
 
-        self.k_cache[:, :, old_size:new_size, :] = key_states
-        self.v_cache[:, :, old_size:new_size, :] = value_states
+        if key_states.is_cuda:
+            update_kv(key_states, value_states, self.k_cache, self.v_cache, old_size)
+        else:
+            self.k_cache[:, :, old_size:new_size, :] = key_states
+            self.v_cache[:, :, old_size:new_size, :] = value_states
 
         self.curr_size = new_size
         self.tokens_seen += seq_len
@@ -164,7 +169,7 @@ class SlidingWindowAttentionLayerCache:
             shape = (
                 1,
                 key_states.shape[1],
-                self.sliding_window_size,
+                2 * self.sliding_window_size,
                 key_states.shape[3],
             )
             self.k_cache = key_states.new_zeros(shape)
@@ -172,17 +177,28 @@ class SlidingWindowAttentionLayerCache:
 
         self.curr_size = min(self.curr_size + roll_size, self.sliding_window_size)
 
-        self.k_cache = torch.roll(self.k_cache, -roll_size, dims=2)
-        self.v_cache = torch.roll(self.v_cache, -roll_size, dims=2)
-
-        self.k_cache[:, :, -roll_size:] = key_states
-        self.v_cache[:, :, -roll_size:] = value_states
+        if key_states.is_cuda:
+            update_kv(
+                key_states, value_states, self.k_cache, self.v_cache,
+                self.tokens_seen % self.sliding_window_size, self.sliding_window_size,
+            )
+        else:
+            # Mirror each position so rollover never needs to move existing tokens.
+            for i in range(roll_size):
+                position = (self.tokens_seen + i) % self.sliding_window_size
+                for offset in (position, position + self.sliding_window_size):
+                    self.k_cache[:, :, offset] = key_states[:, :, i]
+                    self.v_cache[:, :, offset] = value_states[:, :, i]
 
         self.tokens_seen += roll_size
 
-        return self.k_cache[:, :, -self.curr_size :], self.v_cache[
-            :, :, -self.curr_size :
-        ]
+        end = (
+            self.sliding_window_size
+            + (self.tokens_seen - 1) % self.sliding_window_size
+            + 1
+        )
+        start = end - self.curr_size
+        return self.k_cache[:, :, start:end], self.v_cache[:, :, start:end]
 
 
 class MyInklingCache:

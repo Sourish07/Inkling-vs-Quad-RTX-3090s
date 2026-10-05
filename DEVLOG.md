@@ -126,3 +126,5 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 - Skipping log scaling when it's a no-op (tau == 1 until the sequence passes log_scaling_n_floor)
   - Separated out single token case too
 - Running at ~11.22 tok/s
+
+## 10. Fusing normalization, short convolutions, and cache updates
