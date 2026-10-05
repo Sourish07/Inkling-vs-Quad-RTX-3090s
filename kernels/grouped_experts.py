@@ -182,6 +182,7 @@ class GroupedExperts:
         self.experts = torch.empty(len(expert_ids), dtype=torch.int32, device=device)
         self.counts = torch.empty(len(expert_ids), dtype=torch.int32, device=device)
         self.capacity = 0
+        self.group_size = 0  # Set by ExpertCache.prepare before each forward.
 
     def reserve(self, routes):
         """
