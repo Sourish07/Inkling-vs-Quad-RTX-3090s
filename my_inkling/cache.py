@@ -1,4 +1,5 @@
-"""Cache shape names (batch size is currently fixed to 1).
+"""
+Cache shape names (batch size is currently fixed to 1).
 
 d                = feature/channel width
 hk               = key/value heads

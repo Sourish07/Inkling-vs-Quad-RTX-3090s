@@ -8,26 +8,6 @@ import triton.language as tl
 
 
 @triton.jit
-def _route(
-    Indices,
-    Experts,
-    Rows,
-    Counts,
-    ROUTES: tl.constexpr,
-    CAPACITY: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    group = tl.program_id(0)
-    expert = tl.load(Experts + group)
-    routes = tl.arange(0, BLOCK)
-    indices = tl.load(Indices + routes, routes < ROUTES, -1)
-    matches = (routes < ROUTES) & (indices == expert)
-    positions = tl.cumsum(matches.to(tl.int32)) - 1
-    tl.store(Rows + group * CAPACITY + positions, routes, matches)
-    tl.store(Counts + group, tl.sum(matches.to(tl.int32)))
-
-
-@triton.jit
 def _gemm(
     X,
     Pointers,
@@ -45,6 +25,13 @@ def _gemm(
     BN: tl.constexpr,
     BK: tl.constexpr,
 ):
+    """
+    Compute one projection for one tile of one active expert's routed rows.
+
+    Each program finds its weights through the pointer table and dequantizes
+    NVFP4 inline. This lets one launch cover all active experts, wherever their
+    weights are, with no launch per expert and no dequantized copy of the weights.
+    """
     group = tl.program_id(1)
     tile = tl.program_id(0)
     row = tile // tl.cdiv(N, BN) * BM + tl.arange(0, BM)
@@ -134,6 +121,13 @@ def _reduce(
     MAX_EXPERT: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    """
+    Add each token's routed expert outputs, scaled by the router weights, to Output.
+
+    The GEMMs write one row per route, so the rows must be combined per token.
+    Routes whose pointer row is zero belong to other ranks and are skipped, which
+    keeps their stale scratch rows out of the sum.
+    """
     token = tl.program_id(0)
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     acc = tl.zeros((BLOCK,), tl.float32)
@@ -155,6 +149,9 @@ def _reduce(
 class GroupedExperts:
     """
     Reusable pointer table, routing workspace and projection scratch for one layer.
+    - Pointer table: self.pointers
+    - Routing workspace: self.experts, self.counts, self.rows
+    - Projection scratch: self.gate_up, self.activated, self.down
 
     Calls run sequentially on the module's compute stream. The output is owned
     by the caller; internal buffers are overwritten on the next call.
@@ -163,6 +160,12 @@ class GroupedExperts:
     def __init__(
         self, expert_ids, hidden_dim, intermediate_dim, dtype, device, quantized, act_fn
     ):
+        """
+        Allocate the pointer table, group list and counts on the GPU once.
+
+        The cache planner rewrites them on the GPU each forward, so the hot path
+        needs no allocation and no host upload.
+        """
         self.max_expert = max(expert_ids)
         self.hidden_dim = hidden_dim
         self.intermediate_dim = intermediate_dim
@@ -170,35 +173,24 @@ class GroupedExperts:
         self.device = device
         self.quantized = quantized
         self.act_fn = act_fn
-        # Copy active expert IDs and their pointer table together.
         self.pointer_stride = 6 if quantized else 2
-        pointer_size = (self.max_expert + 1) * self.pointer_stride
-        self.host_metadata = torch.zeros(
-            pointer_size + len(expert_ids), dtype=torch.int64, pin_memory=True
+        self.pointers = torch.zeros(
+            (self.max_expert + 1) * self.pointer_stride,
+            dtype=torch.int64,
+            device=device,
         )
-        self.metadata = torch.empty_like(self.host_metadata, device=device)
-        self.pointer_array = (
-            self.host_metadata[:pointer_size].numpy().reshape(-1, self.pointer_stride)
-        )
-        self.expert_array = self.host_metadata[pointer_size:].numpy()
-        self.pointers = self.metadata[:pointer_size]
-        self.experts = self.metadata[pointer_size:]
-        self.metadata_copied = torch.cuda.Event()
+        self.experts = torch.empty(len(expert_ids), dtype=torch.int32, device=device)
         self.counts = torch.empty(len(expert_ids), dtype=torch.int32, device=device)
         self.capacity = 0
-
-    def set_weights(self, weights):
-        # The previous async copy must finish before we rewrite pinned memory.
-        self.metadata_copied.synchronize()
-        self.pointer_array[:] = 0
-        self.group_size = len(weights)
-        self.expert_array[: self.group_size] = list(weights)
-        for expert, tensors in weights.items():
-            self.pointer_array[expert] = [w.data_ptr() for w in tensors]
-        self.metadata.copy_(self.host_metadata, non_blocking=True)
-        self.metadata_copied.record()
+        self.group_size = 0  # Set by ExpertCache.prepare before each forward.
 
     def reserve(self, routes):
+        """
+        Grow the routing rows and projection scratch to hold `routes` routes.
+
+        Prefill has many more routes than decode. Growing to a power of two and
+        never shrinking lets later forwards reuse the same buffers.
+        """
         if routes <= self.capacity:
             return
         self.capacity = triton.next_power_of_2(routes)
@@ -212,27 +204,22 @@ class GroupedExperts:
         self.activated = torch.empty((self.capacity, self.intermediate_dim), **options)
         self.down = torch.empty((self.capacity, self.hidden_dim), **options)
 
-    def forward(self, x, indices, weights, output, ready_events):
+    def forward(self, x, indices, weights, output):
+        """
+        Run gate/up, activation, down and the weighted sum for all active experts.
+
+        `ExpertCache.prepare` must run first: it fills the pointers, groups, counts
+        and rows that these kernels read. The number of launches is then fixed per
+        layer and does not depend on how many experts are active.
+        """
         routes = indices.numel()
         self.reserve(routes)
         top_k = indices.shape[1]
-        _route[(self.group_size,)](
-            indices,
-            self.experts,
-            self.rows,
-            self.counts,
-            routes,
-            self.capacity,
-            triton.next_power_of_2(routes),
-        )
         for projection, inputs, target, n, k in (
             (0, x, self.gate_up, 2 * self.intermediate_dim, self.hidden_dim),
             (1, self.activated, self.down, self.hidden_dim, self.intermediate_dim),
         ):
-            if ready_events:
-                torch.cuda.current_stream().wait_event(ready_events[projection])
-
-            # self.group_size is number of routed_experts! (it's just part of launch grid)
+            # The GPU planner compacts active groups; unused groups have count zero.
             _gemm[(triton.cdiv(routes, 16) * triton.cdiv(n, 64), self.group_size)](
                 inputs,
                 self.pointers,
@@ -250,6 +237,7 @@ class GroupedExperts:
                 64,
                 64,
             )
+            # TODO: I can probably fuse
             if projection == 0:
                 projected = self.gate_up[:routes]
                 torch.mul(

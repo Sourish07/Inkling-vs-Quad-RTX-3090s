@@ -76,3 +76,44 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 - `_HeadParallelConv1d` because `local_channels` is `total_channels // world_size`
 
 ## 7. Grouping expert GEMMs and reusing buffers
+
+- Combines all expert GEMMs into a single batched GEMM
+  - just a regular GEMM with the experts as a launch dimension
+  - dequantization now happens in the kernel as well
+  - a pointer table is used so the expert weights don't have to be contiguous
+- `_route` just runs the "stream compaction algorithm" to quickly select which tokens to use for each expert
+- The reused buffers are `self.host_metadata`, `self.metadata`, 
+(the views into them), and then `self.counts`
+  - also the ones created in `reserve()`
+- Metadata stores pointer table & active expert list
+  - Pointer table
+    - one row for each expert ID
+    - each row has `pointer_stride` entries; 6 for quantized layer, 2 for unquantized (bf16)
+      - each entry is a raw GPU pointer to a weight tensor for that expert
+  - Expert list
+    - one entry for each local expert
+    - first `group_size` entries hold the active expert list
+      - entry `g` tells GEMM group `g` which expert it computes
+
+## 8. GPU routing and expert cache decisions
+
+- The top-k router was already on GPU. Expert ID downloads, Python LRU
+  decisions, and repeated host pointer-table uploads remained in the hot path.
+- Really bad sync points (each blocks host until GPU stream is empty):
+  - `torch.unique(top_k_index).tolist()`
+  - Using an `OrderedDict` for the LRU; each access is a sync
+    - `_, slot = self.lru_slots.popitem(last=False)`
+  - Updating metadata table from host and then copying to GPU
+    - `self.metadata.copy_(self.host_metadata, non_blocking=True)`
+- A GPU planner now compacts routing rows, protects active cache hits, assigns
+  misses to least-recently-used slots, and writes the GEMM pointer table.
+- For prefill, where there may be expert overflow, we directly pass in pointer to CUDA-mapped pinned CPU weights into cache slots
+- Running at ~9.88 tok/s
+
+## Some notes on pinned memory
+
+- Memory that's allocated on host but cannot be "paged out" to disk
+- CUDA driver then translates that physical host address to a GPU virtual address
+  - Doesn't use VRAM until GPU accesses pointer
+  - `.data_ptr()` will return the GPU virtual address, regardless of if it's actually in VRAM or host memory
+  - When copying, there's no intermediate staging buffer (ex. because non-pinned memory may be on disk)

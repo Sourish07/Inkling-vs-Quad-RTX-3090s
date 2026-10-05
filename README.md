@@ -17,5 +17,7 @@ List of optimizations:
   - Speed: 4.39 tok/s
 - 7. Grouped expert GEMMs with reusable routing and scratch buffers
   - Speed: 9.45 tok/s
+- 8. Moving rest of hot path to GPU
+  - Speed: 9.88 tok/s
  
 Please read [DEVLOG.md](DEVLOG.md) for more details about my journey.
