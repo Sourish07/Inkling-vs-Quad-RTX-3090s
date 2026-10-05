@@ -96,6 +96,8 @@ def _plan(
     tl.store(Counts + group, counts, active)
     positions = tl.cumsum(matches.to(tl.int32), 1) - 1
     tl.store(Rows + group[:, None] * CAPACITY + positions, r[None, :], matches)
+
+    # loop that updates the pointer table
     for bank in tl.static_range(STRIDE):
         source = tl.load(Sources + e * STRIDE + bank, e < LOCAL, 0)
         destination = tl.load(
