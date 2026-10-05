@@ -25,6 +25,13 @@ def _gemm(
     BN: tl.constexpr,
     BK: tl.constexpr,
 ):
+    """
+    Compute one projection for one tile of one active expert's routed rows.
+
+    Each program finds its weights through the pointer table and dequantizes
+    NVFP4 inline. This lets one launch cover all active experts, wherever their
+    weights are, with no launch per expert and no dequantized copy of the weights.
+    """
     group = tl.program_id(1)
     tile = tl.program_id(0)
     row = tile // tl.cdiv(N, BN) * BM + tl.arange(0, BM)
@@ -114,6 +121,13 @@ def _reduce(
     MAX_EXPERT: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    """
+    Add each token's routed expert outputs, scaled by the router weights, to Output.
+
+    The GEMMs write one row per route, so the rows must be combined per token.
+    Routes whose pointer row is zero belong to other ranks and are skipped, which
+    keeps their stale scratch rows out of the sum.
+    """
     token = tl.program_id(0)
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     acc = tl.zeros((BLOCK,), tl.float32)
@@ -143,6 +157,12 @@ class GroupedExperts:
     def __init__(
         self, expert_ids, hidden_dim, intermediate_dim, dtype, device, quantized, act_fn
     ):
+        """
+        Allocate the pointer table, group list and counts on the GPU once.
+
+        The cache planner rewrites them on the GPU each forward, so the hot path
+        needs no allocation and no host upload.
+        """
         self.max_expert = max(expert_ids)
         self.hidden_dim = hidden_dim
         self.intermediate_dim = intermediate_dim
@@ -161,6 +181,12 @@ class GroupedExperts:
         self.capacity = 0
 
     def reserve(self, routes):
+        """
+        Grow the routing rows and projection scratch to hold `routes` routes.
+
+        Prefill has many more routes than decode. Growing to a power of two and
+        never shrinking lets later forwards reuse the same buffers.
+        """
         if routes <= self.capacity:
             return
         self.capacity = triton.next_power_of_2(routes)
@@ -175,6 +201,13 @@ class GroupedExperts:
         self.down = torch.empty((self.capacity, self.hidden_dim), **options)
 
     def forward(self, x, indices, weights, output):
+        """
+        Run gate/up, activation, down and the weighted sum for all active experts.
+
+        `ExpertCache.prepare` must run first: it fills the pointers, groups, counts
+        and rows that these kernels read. The number of launches is then fixed per
+        layer and does not depend on how many experts are active.
+        """
         routes = indices.numel()
         self.reserve(routes)
         top_k = indices.shape[1]

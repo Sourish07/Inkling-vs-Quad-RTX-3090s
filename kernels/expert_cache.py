@@ -31,6 +31,13 @@ def _plan(
     S: tl.constexpr,
     R: tl.constexpr,
 ):
+    """
+    Group routes by expert, assign LRU slots to cache misses, write the pointer table.
+
+    Runs as one program so all decisions see the same cache state. Planning on
+    the GPU means the host never downloads expert IDs (a forced sync) and never
+    rebuilds or uploads the pointer table.
+    """
     e = tl.arange(0, E)
     s = tl.arange(0, S)
     r = tl.arange(0, R)
@@ -108,6 +115,13 @@ def _copy(
     BLOCK: tl.constexpr,
     WORKERS: tl.constexpr,
 ):
+    """
+    Copy the expert that `_plan` assigned to this slot from host memory into the slot.
+
+    Only the GPU knows which experts missed the cache, so the host cannot start
+    these copies. Each program reads the pinned host weights directly; WORKERS
+    programs per slot share the tiles. Slots with no assignment exit at once.
+    """
     worker = tl.program_id(0)
     slot = tl.program_id(1)
     expert = tl.load(CopyExperts + slot)
@@ -131,6 +145,13 @@ class ExpertCache:
     """
 
     def __init__(self, weights, names, num_slots, grouped):
+        """
+        Allocate the cache slots and the address tables that the planner selects from.
+
+        Every address a pointer-table entry can hold (resident tensor, pinned host
+        tensor or cache slot) is recorded here once, so a forward does no host work
+        to find weights.
+        """
         self.weights = weights  # Keep mapped host allocations alive.
         ids = sorted(weights[names[0]])
         self.start = ids[0]
@@ -184,6 +205,13 @@ class ExpertCache:
         self.grouped = grouped
 
     def prepare(self, indices):
+        """
+        Plan this forward's routing and cache state, then load the missing experts.
+
+        Must run before `GroupedExperts.forward`. The host does not know how many
+        experts are active, so `group_size` is set to the upper bound and unused
+        groups have a count of zero.
+        """
         routes = indices.numel()
         self.grouped.reserve(routes)
         _plan[(1,)](
