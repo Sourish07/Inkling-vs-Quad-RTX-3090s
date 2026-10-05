@@ -708,6 +708,14 @@ class MyInkling(nn.Module):
 
         self.mtp = None  # TODO: add MTP support
 
+    def restore_fp32(self) -> None:
+        """Undo a dtype cast for the checkpoint's FP32 convolutions and router biases."""
+        for module in self.modules():
+            if isinstance(module, MyInklingShortConv):
+                module.conv1d.float()
+            elif isinstance(module, MyInklingTopkRouter):
+                module.e_score_correction_bias = module.e_score_correction_bias.float()
+
     def forward(
         self, input_ids: Int[T, "bs s"], cache: MyInklingCache | None = None
     ) -> Fp[T, "bs 1 vocab"]:

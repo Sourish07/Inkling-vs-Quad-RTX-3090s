@@ -1,6 +1,7 @@
 import torch
 from jaxtyping import Float as Fp
 from jaxtyping import Int
+from modelopt.torch.quantization.qtensor import NVFP4QTensor
 from torch import Tensor as T
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
@@ -14,31 +15,42 @@ from .model import (
 
 class OffloadedExperts(nn.Module):
     """
-    Compute local experts, copying CPU weights to GPU on demand.
+    Drop-in replacement for `MyInklingExperts` that stores experts on CPU.
+    - Compute local experts, copying CPU weights to GPU on demand.
+    - Expects weights already sharded with EP and replicated inputs/routing.
 
-    Expects weights already sharded with EP and replicated inputs/routing.
-    f: expert intermediate dimension; d: hidden dimension.
+    `weights` maps `gate_up_proj` and `down_proj` to `{expert_id: tensor}`. NVFP4
+    banks stay packed and add `<projection>_scale` and `<projection>_scale2`.
     """
 
     def __init__(
         self,
         experts_module: MyInklingExperts,
         device_mesh: DeviceMesh,
-        gate_up: dict[int, Fp[T, "2*f d"]],
-        down: dict[int, Fp[T, "d f"]],
+        weights: dict[str, dict[int, T]],
     ):
         super().__init__()
-
-        self.num_experts = experts_module.num_experts
-        self.hidden_dim = experts_module.hidden_dim
-        self.intermediate_dim = experts_module.intermediate_dim
         self.act_fn = experts_module.act_fn
-
         self.device_mesh = device_mesh
-        self.weights = {
-            expert_id: (gate_up_weight, down[expert_id])
-            for expert_id, gate_up_weight in gate_up.items()
-        }
+        self.weights = weights
+        self.packed = "gate_up_proj_scale" in weights
+
+    def matrix(self, projection: str, expert_id: int, like: T) -> T:
+        weight = self.weights[projection][expert_id].to(like.device)
+        if not self.packed:
+            return weight
+        scale, scale2 = (
+            self.weights[projection + suffix][expert_id].to(like.device)
+            for suffix in ("_scale", "_scale2")
+        )
+        shape = torch.Size((*weight.shape[:-1], weight.shape[-1] * 2))
+        return NVFP4QTensor(shape, like.dtype, weight).dequantize(
+            dtype=like.dtype,
+            scale=scale,
+            double_scale=scale2,
+            block_sizes={-1: 16},
+            fast=False,
+        )
 
     def forward(
         self,
@@ -47,25 +59,30 @@ class OffloadedExperts(nn.Module):
         top_k_weights: Fp[T, "t k"],
     ) -> Fp[T, "t d"]:
         final_hidden_states = torch.zeros_like(hidden_states, dtype=torch.float32)
+
         for expert_id in torch.unique(top_k_index).tolist():
-            if expert_id not in self.weights:
+            if expert_id not in self.weights["down_proj"]:
                 continue
-            gate_up, down = (
-                weight.to(hidden_states.device) for weight in self.weights[expert_id]
-            )
             token_idx, top_k_pos = torch.where(top_k_index == expert_id)
-            current_state = hidden_states[token_idx]
-
-            gate, up = F.linear(current_state, gate_up).chunk(2, dim=-1)
-
-            current_hidden_states = F.linear(self.act_fn(gate) * up, down)
+            projected = F.linear(
+                hidden_states[token_idx],
+                self.matrix("gate_up_proj", expert_id, hidden_states),
+            )
+            # Packed checkpoints retain interleaved gate/up rows.
+            gate, up = (
+                (projected[:, 0::2], projected[:, 1::2])
+                if self.packed
+                else projected.chunk(2, dim=-1)
+            )
+            current_hidden_states = F.linear(
+                self.act_fn(gate) * up,
+                self.matrix("down_proj", expert_id, hidden_states),
+            )
             current_hidden_states *= top_k_weights[token_idx, top_k_pos, None]
 
             final_hidden_states.index_add_(
                 0, token_idx, current_hidden_states.to(final_hidden_states.dtype)
             )
-
-            del gate_up, down
 
         torch.distributed.all_reduce(
             final_hidden_states, group=self.device_mesh.get_group()
@@ -78,16 +95,12 @@ def apply_ep_plan(
     device_mesh: DeviceMesh,
     expert_state_dict: dict[str, dict[int, torch.Tensor]],
 ) -> MyInkling:
-
     for name, module in list(model.named_modules()):
         if isinstance(module, MyInklingExperts):
-            gate_up = expert_state_dict[f"{name}.gate_up_proj"]
-            down = expert_state_dict[f"{name}.down_proj"]
-
-            model.set_submodule(
-                name,
-                OffloadedExperts(
-                    module, device_mesh=device_mesh, gate_up=gate_up, down=down
-                ),
-            )
+            weights = {
+                key.removeprefix(f"{name}."): bank
+                for key, bank in expert_state_dict.items()
+                if key.startswith(f"{name}.")
+            }
+            model.set_submodule(name, OffloadedExperts(module, device_mesh, weights))
     return model
