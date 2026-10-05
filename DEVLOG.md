@@ -45,3 +45,13 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
   - `self.weight.to_local()` is used here because everything is done locally with no collectives needed
 - `_TPSharedExperts` is needed because shared experts use raw 3D parameters rather than `nn.Linear` modules
 - `run_naive.py` now running at ~7.45 s/tok!
+
+## 4. Adding expert parallelism + CPU loading
+
+- Very naive version; Just created a drop-in replacement for `MyInklingExperts`
+- Uses expert parallelism; No caching for now. Just loads & dequantizes each of the routed experts as needed
+- state dictionary is loaded in two chunks, first the non-expert parameters, then the expert parameters
+  - The expert parameters are split between GPU & CPU memory because all experts don't fit in host memory
+- Checkpoint loading is still kinda slow; We need to optimize that
+- Because we use TP for the non-expert layers, all expert layers receive the same input. No all2all necessary
+- `run.py` is running at ~2.6 tok/s!

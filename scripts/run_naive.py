@@ -3,7 +3,6 @@
 Run four GPUs with ``torchrun --standalone --nproc-per-node=4 -m scripts.run_naive``.
 """
 
-import json
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -29,13 +28,17 @@ from torch import Tensor as T
 from torch import nn
 from torch.distributed.tensor import DTensor
 from torch.nn import functional as F
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoTokenizer
 
 from my_inkling import MyInkling
 from my_inkling.cache import MyInklingCache
 from my_inkling.model import MyInklingMoE
 from my_inkling.tp_plan import apply_tp_plan
-from utils.checkpointing import convert_checkpoint_tensors, load_non_expert_state_dict
+from utils.checkpointing import (
+    convert_checkpoint_tensors,
+    load_config,
+    load_non_expert_state_dict,
+)
 from utils.dist import Timer, get_device_mesh, setup_ddp_local, setup_rank_aware_logger
 
 GIB = 1024**3
@@ -45,15 +48,6 @@ DTYPES = {
     "U8": torch.uint8,
     "F8_E4M3": torch.float8_e4m3fn,
 }
-
-
-def load_config(path):
-    config = AutoConfig.from_pretrained(path)
-    text = json.loads((Path(path) / "config.json").read_text())["text_config"]
-    # Small's legacy config otherwise overwrites the routed-expert width.
-    if "dense_intermediate_size" in text:
-        config.text_config.moe_intermediate_size = text["intermediate_size"]
-    return config
 
 
 class PackedExperts(nn.Module):
@@ -150,12 +144,7 @@ def build_model(config, raw_tensors):
                         if key.startswith(prefix)
                     }
                 )
-                layer.mlp.gate.e_score_correction_bias = (
-                    layer.mlp.gate.e_score_correction_bias.float()
-                )
-        for name, parameter in model.named_parameters():
-            if "conv1d.weight" in name:
-                parameter.data = parameter.float()
+        model.restore_fp32()
     if set(model.state_dict()) != set(tensors):
         raise ValueError(
             f"Checkpoint/model keys differ: {set(model.state_dict()) ^ set(tensors)}"
