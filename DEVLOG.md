@@ -109,3 +109,11 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
   misses to least-recently-used slots, and writes the GEMM pointer table.
 - For prefill, where there may be expert overflow, we directly pass in pointer to CUDA-mapped pinned CPU weights into cache slots
 - Running at ~9.88 tok/s
+
+## Some notes on pinned memory
+
+- Memory that's allocated on host but cannot be "paged out" to disk
+- CUDA driver then translates that physical host address to a GPU virtual address
+  - Doesn't use VRAM until GPU accesses pointer
+  - `.data_ptr()` will return the GPU virtual address, regardless of if it's actually in VRAM or host memory
+  - When copying, there's no intermediate staging buffer (ex. because non-pinned memory may be on disk)
