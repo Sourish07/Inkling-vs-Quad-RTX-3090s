@@ -74,3 +74,5 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 - `_VocabParallelEmbedding` is present for the same previous reason (i.e. the RMSNorm needs its inputs all-reduced)
 - `_TPSharedExperts` because the weights aren't `nn.Linear` modules, but rather just raw weight tensors
 - `_HeadParallelConv1d` because `local_channels` is `total_channels // world_size`
+
+## 7. Grouping expert GEMMs and reusing buffers

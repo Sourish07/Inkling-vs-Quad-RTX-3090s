@@ -15,5 +15,7 @@ List of optimizations:
   - Speed: 3.28 tok/s
 - 6. Removing DTensor interface
   - Speed: 4.39 tok/s
+- 7. Grouped expert GEMMs with reusable routing and scratch buffers
+  - Speed: 9.45 tok/s
  
 Please read [DEVLOG.md](DEVLOG.md) for more details about my journey.

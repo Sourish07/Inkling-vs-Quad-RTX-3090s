@@ -439,6 +439,7 @@ dependencies = [
     { name = "requests" },
     { name = "torch" },
     { name = "transformers" },
+    { name = "triton" },
     { name = "tyro" },
 ]
 
@@ -458,6 +459,7 @@ requires-dist = [
     { name = "requests", specifier = ">=2.34.2" },
     { name = "torch", specifier = ">=2.13.0", index = "https://download.pytorch.org/whl/cu132" },
     { name = "transformers", specifier = ">=5.18.0" },
+    { name = "triton", specifier = ">=3.8.0" },
     { name = "tyro", specifier = ">=1.0.13" },
 ]
 
