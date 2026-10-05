@@ -74,7 +74,7 @@ num_tokens = inputs["input_ids"].shape[1]
 logger.info(f"running generation with {num_tokens} input tokens")
 
 model.eval()
-max_new_tokens = 2**5
+max_new_tokens = 2**7
 streamer = (
     TextStreamer(tokenizer, skip_special_tokens=True) if local_rank == 0 else None
 )
