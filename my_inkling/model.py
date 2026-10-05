@@ -1,4 +1,3 @@
-import math
 from dataclasses import dataclass
 
 import torch
@@ -545,13 +544,6 @@ class MyInklingAttention(nn.Module):
             position_bias = self.rel_logits_proj(relative_states, distance)
             allowed = (distance >= 0) & (distance <= cache.position)
             sdpa_mask = position_bias.masked_fill(~allowed, float("-inf"))
-        elif q_len == 1:
-            # Cached keys end at this query; all are causal and within the SWA window.
-            logits = relative_states @ self.rel_logits_proj.proj
-            position_bias = logits.transpose(1, 2)[..., :kv_len].flip(-1)
-            if kv_len > self.rel_extent:
-                position_bias = F.pad(position_bias, (kv_len - self.rel_extent, 0))
-            sdpa_mask = position_bias
         else:
             # Relative distances do not depend on the absolute cache position.
             distance: Int[T, "s k_len"] = (
@@ -582,18 +574,13 @@ class MyInklingAttention(nn.Module):
             and self.log_scaling_n_floor is not None
             and query_start + q_len > self.log_scaling_n_floor
         ):
-            if q_len == 1:
-                tau = 1.0 + self.log_scaling_alpha * math.log(
-                    (query_start + 1) / self.log_scaling_n_floor
-                )
-            else:
-                effective_n = (
-                    torch.arange(q_len, device=hidden_states.device) + query_start + 1
-                ).float()
-                tau = 1.0 + self.log_scaling_alpha * torch.log(
-                    (effective_n / self.log_scaling_n_floor).clamp(min=1.0)
-                )
-                tau = tau.view(1, 1, q_len, 1)
+            effective_n = (
+                torch.arange(q_len, device=hidden_states.device) + query_start + 1
+            ).float()
+            tau = 1.0 + self.log_scaling_alpha * torch.log(
+                (effective_n / self.log_scaling_n_floor).clamp(min=1.0)
+            )
+            tau = tau.view(1, 1, q_len, 1)
             query_states = (query_states.float() * tau).to(query_states.dtype)
             sdpa_mask = (sdpa_mask.float() * tau).to(sdpa_mask.dtype)
 
