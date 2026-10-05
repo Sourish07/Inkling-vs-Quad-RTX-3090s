@@ -1,4 +1,3 @@
-import math
 from dataclasses import dataclass
 
 import torch
@@ -529,6 +528,7 @@ class MyInklingAttention(nn.Module):
         )
 
         query_start = 0
+        static_decode = cache is not None and cache.position is not None
 
         if cache is not None:
             query_start = cache.layers[self.layer_idx].tokens_seen
@@ -539,13 +539,11 @@ class MyInklingAttention(nn.Module):
         relative_states: Fp[T, "bs s h r"] = r.view(bs, q_len, self.num_heads, -1)
 
         kv_len = key_states.shape[2]
-        if q_len == 1:
-            # Cached keys end at this query; all are causal and within the SWA window.
-            logits = relative_states @ self.rel_logits_proj.proj
-            position_bias = logits.transpose(1, 2)[..., :kv_len].flip(-1)
-            if kv_len > self.rel_extent:
-                position_bias = F.pad(position_bias, (kv_len - self.rel_extent, 0))
-            sdpa_mask = position_bias
+        if static_decode:
+            distance = cache.decode_distance(self.layer_idx)
+            position_bias = self.rel_logits_proj(relative_states, distance)
+            allowed = (distance >= 0) & (distance <= cache.position)
+            sdpa_mask = position_bias.masked_fill(~allowed, float("-inf"))
         else:
             # Relative distances do not depend on the absolute cache position.
             distance: Int[T, "s k_len"] = (
@@ -562,22 +560,27 @@ class MyInklingAttention(nn.Module):
 
         # Inkling scales both content scores and relative bias in full attention.
         if (
+            static_decode
+            and not self.is_sliding
+            and self.log_scaling_n_floor is not None
+        ):
+            tau = 1.0 + self.log_scaling_alpha * torch.log(
+                ((cache.position.float() + 1) / self.log_scaling_n_floor).clamp(min=1.0)
+            )
+            query_states = (query_states.float() * tau).to(query_states.dtype)
+            sdpa_mask = (sdpa_mask.float() * tau).to(sdpa_mask.dtype)
+        elif (
             not self.is_sliding
             and self.log_scaling_n_floor is not None
             and query_start + q_len > self.log_scaling_n_floor
         ):
-            if q_len == 1:
-                tau = 1.0 + self.log_scaling_alpha * math.log(
-                    (query_start + 1) / self.log_scaling_n_floor
-                )
-            else:
-                effective_n = (
-                    torch.arange(q_len, device=hidden_states.device) + query_start + 1
-                ).float()
-                tau = 1.0 + self.log_scaling_alpha * torch.log(
-                    (effective_n / self.log_scaling_n_floor).clamp(min=1.0)
-                )
-                tau = tau.view(1, 1, q_len, 1)
+            effective_n = (
+                torch.arange(q_len, device=hidden_states.device) + query_start + 1
+            ).float()
+            tau = 1.0 + self.log_scaling_alpha * torch.log(
+                (effective_n / self.log_scaling_n_floor).clamp(min=1.0)
+            )
+            tau = tau.view(1, 1, q_len, 1)
             query_states = (query_states.float() * tau).to(query_states.dtype)
             sdpa_mask = (sdpa_mask.float() * tau).to(sdpa_mask.dtype)
 
@@ -733,4 +736,6 @@ class MyInkling(nn.Module):
             if unpadded_vocab_size is not None
             else padded_logits
         )
+        if cache is not None and cache.position is not None:
+            cache.position.add_(1)
         return logits

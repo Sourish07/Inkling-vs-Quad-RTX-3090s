@@ -1,4 +1,5 @@
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import tyro
@@ -14,6 +15,7 @@ from transformers import (
 )
 
 from my_inkling import MyInkling, MyInklingCache, apply_ep_plan, apply_tp_plan
+from my_inkling.decode_graph import DecodeGraph
 from utils import (
     Profiler,
     get_device_mesh,
@@ -96,14 +98,16 @@ def main(
     streamer = (
         TextStreamer(tokenizer, skip_special_tokens=True) if local_rank == 0 else None
     )
+    output_pool = ThreadPoolExecutor(max_workers=1) if streamer is not None else None
+    output_future = None
     next_input = inputs["input_ids"]
 
     # Step 0 is prefill (+ first token); the decode clock starts after it.
     decode_start = 0.0
     num_decode_tokens = 0
     cache = MyInklingCache(config.text_config)
+    decode_graph = None
 
-    # ENABLE_PROFILING=1 also enables it; only rank 0 records a trace.
     profiler = Profiler(enable=profile)
     profiler.start()
 
@@ -112,31 +116,53 @@ def main(
             # Names each forward pass in the profiler trace.
             label = "prefill" if step == 0 else f"decode_{step}"
             with record_function(label):
-                logits = model(next_input, cache=cache)
-            next_input = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            torch.distributed.broadcast(next_input, src=0)
+                if step == 0:
+                    logits = model(next_input, cache=cache)
+                    next_input = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                    torch.distributed.broadcast(next_input, src=0)
+                else:
+                    assert decode_graph is not None
+                    next_input = decode_graph.replay()
+            host_token = next_input.cpu()
             if streamer is not None:
-                streamer.put(next_input.cpu())
-            # .item() syncs the device, so the timestamps are accurate.
-            is_eos = next_input.item() == tokenizer.eos_token_id
+                assert output_pool is not None
+                if output_future is not None:
+                    output_future.result()
+                output_future = output_pool.submit(streamer.put, host_token)
+            is_eos = host_token.item() == tokenizer.eos_token_id
             if step == 0:
-                decode_start = time.perf_counter()
+                if not is_eos and max_new_tokens > 1:
+                    logger.info("Warming up and capturing complete decode CUDA graph")
+                    decode_graph = DecodeGraph(
+                        model,
+                        cache,
+                        next_input,
+                        capacity=num_tokens + max_new_tokens - 1,
+                    )
+                    decode_start = time.perf_counter()
             else:
                 num_decode_tokens += 1
             if is_eos:
                 break
 
+    if streamer is not None:
+        assert output_pool is not None and output_future is not None
+        output_future.result()
+        output_pool.shutdown()
+        streamer.end()
     decode_time = time.perf_counter() - decode_start
     profiler.stop()
     profiler.export_chrome_trace("trace.json.gz")
-    if streamer is not None:
-        streamer.end()
     if local_rank == 0 and num_decode_tokens > 0:
         logger.info(
             f"Decode: {num_decode_tokens} tokens in {decode_time:.2f}s "
             f"= {num_decode_tokens / decode_time:.2f} tok/s (excl. prefill)"
         )
 
+    # NCCL communicator shutdown waits for every captured graph to be released.
+    if decode_graph is not None:
+        torch.cuda.synchronize()
+        decode_graph.graph.reset()
     torch.distributed.destroy_process_group()
 
 

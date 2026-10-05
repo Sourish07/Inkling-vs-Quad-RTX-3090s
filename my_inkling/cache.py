@@ -91,6 +91,7 @@ class FullAttentionLayerCache:
         self.v_cache: Fp[T, "1 hk capacity c"] | None = None
         self.curr_size = 0
         self.tokens_seen = 0
+        self.key_positions: T | None = None
 
     def allocate(
         self, reference: Fp[T, "1 hk reference_length c"], size: int = 256
@@ -145,6 +146,7 @@ class SlidingWindowAttentionLayerCache:
         self.v_cache: Fp[T, "1 hk capacity c"] | None = None
         self.curr_size = 0
         self.tokens_seen = 0
+        self.key_positions: T | None = None
 
     def update_cache(
         self,
@@ -197,6 +199,55 @@ class MyInklingCache:
         self.layers = [
             layer_classes[layer_type](config) for layer_type in config.layer_types
         ]
+        self.position = None
+
+    def prepare_decode(self, capacity: int) -> None:
+        """Freeze a populated batch-one cache for at most `capacity` total tokens.
+
+        Sliding keys retain their physical ring order; attention masks use GPU
+        distances instead of moving keys or changing tensor shapes each token.
+        `position` becomes the live token counter; per-layer Python sizes freeze.
+        """
+        assert self.position is None
+        seen = self.layers[0].tokens_seen
+        assert 0 < seen < capacity
+        for layer in self.layers:
+            assert layer.tokens_seen == seen
+            assert all(conv.initialized for conv in layer.conv_caches)
+            assert layer.k_cache is not None and layer.v_cache is not None
+            if isinstance(layer, FullAttentionLayerCache):
+                shape = (1, layer.kv_heads, capacity, layer.head_dim)
+                key = layer.k_cache.new_zeros(shape)
+                value = layer.v_cache.new_zeros(shape)
+                key[:, :, :seen].copy_(layer.k_cache[:, :, :seen])
+                value[:, :, :seen].copy_(layer.v_cache[:, :, :seen])
+            else:
+                window = layer.sliding_window_size
+                key = layer.k_cache[:, :, :window].clone()
+                value = layer.v_cache[:, :, :window].clone()
+            layer.k_cache, layer.v_cache = key, value
+            layer.key_positions = torch.arange(key.shape[2], device=key.device)
+        self.position = torch.tensor(seen, dtype=torch.int64, device=key.device)
+
+    def decode_distance(self, layer_idx: int) -> T:
+        layer = self.layers[layer_idx]
+        assert self.position is not None and layer.key_positions is not None
+        distance = self.position - layer.key_positions
+        if isinstance(layer, SlidingWindowAttentionLayerCache):
+            distance = distance.remainder(layer.sliding_window_size)
+        return distance.unsqueeze(0)
+
+    def decode_buffers(self) -> list[T]:
+        """Mutable request state to preserve across graph warmup and capture."""
+        return [self.position] + [
+            buffer
+            for layer in self.layers
+            for buffer in (
+                layer.k_cache,
+                layer.v_cache,
+                *(conv.cache for conv in layer.conv_caches),
+            )
+        ]
 
     def update_attn_cache(
         self,
@@ -204,6 +255,20 @@ class MyInklingCache:
         value_states: Fp[T, "1 hk s c"],
         layer_idx: int,
     ) -> tuple[Fp[T, "1 hk k_len c"], Fp[T, "1 hk k_len c"]]:
+        if self.position is not None:
+            assert key_states.shape[0] == key_states.shape[2] == 1
+            layer = self.layers[layer_idx]
+            window = getattr(layer, "sliding_window_size", 0)
+            update_kv(
+                key_states,
+                value_states,
+                layer.k_cache,
+                layer.v_cache,
+                self.position,
+                window,
+                mirror=False,
+            )
+            return layer.k_cache, layer.v_cache
         return self.layers[layer_idx].update_cache(key_states, value_states)
 
     def update_conv_cache(
