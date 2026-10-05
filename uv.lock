@@ -318,6 +318,21 @@ wheels = [
 ]
 
 [[package]]
+name = "flashpack"
+version = "0.4.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "accelerate" },
+    { name = "click" },
+    { name = "safetensors" },
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/72/b4/d9d737e3b10ce18b52680b5702c70d33d663dfeee91fb7ca78d9338aba77/flashpack-0.4.4.tar.gz", hash = "sha256:d46bc49ac6c292c039b99c7b7d7bdb469e18ecb87038698566458fd0a3102c7d", size = 1145726, upload-time = "2026-08-17T18:27:42.165Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/75/ad/b83823c37454dd04151a2eb477c1a6e4352b19907626319fe4bb1af9b375/flashpack-0.4.4-py3-none-any.whl", hash = "sha256:8f830d7f1f24f9977c4732b04d908f0ee68122fb4872812537f1c8ecc63a9556", size = 64332, upload-time = "2026-08-17T18:27:40.493Z" },
+]
+
+[[package]]
 name = "fsspec"
 version = "2026.7.0"
 source = { registry = "https://pypi.org/simple" }
@@ -432,6 +447,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "accelerate" },
     { name = "einops" },
+    { name = "flashpack" },
     { name = "huggingface-hub" },
     { name = "jaxtyping" },
     { name = "loguru" },
@@ -452,6 +468,7 @@ dev = [
 requires-dist = [
     { name = "accelerate", specifier = ">=1.15.0" },
     { name = "einops", specifier = ">=0.8.2" },
+    { name = "flashpack", specifier = ">=0.4.4" },
     { name = "huggingface-hub", specifier = ">=1.21.0" },
     { name = "jaxtyping", specifier = ">=0.3.10" },
     { name = "loguru", specifier = ">=0.7.3" },

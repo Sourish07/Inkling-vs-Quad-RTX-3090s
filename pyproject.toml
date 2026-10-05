@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.15.0",
     "einops>=0.8.2",
+    "flashpack>=0.4.4",
     "huggingface-hub>=1.21.0",
     "jaxtyping>=0.3.10",
     "loguru>=0.7.3",
