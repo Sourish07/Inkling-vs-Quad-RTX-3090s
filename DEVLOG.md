@@ -128,3 +128,13 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 - Running at ~11.22 tok/s
 
 ## 10. Fusing normalization, short convolutions, and cache updates
+
+- Three Triton inference kernels: 
+  - RMSNorm, which doesn't require the input to be contiguous
+    - Rounds normalized activations to match PyTorch
+  - Single-token depthwise convolution, which updates the conv cache as well
+    - Also adds residual for the attn-output & mlp-output
+  - Paired K/V cache writes, which for sliding window, writes the tokens twice
+    - Uses a mirrored ring buffer; cost is double storage
+    - Replaced `torch.roll`, which would create new allocation each time
+- Running at ~14.77 tok/s!

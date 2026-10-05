@@ -292,6 +292,7 @@ def test_attention_fp32(layer_idx: int, text_config: InklingTextConfig) -> None:
 
 
 @torch.no_grad()
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="K/V cache requires CUDA")
 @pytest.mark.parametrize("layer_idx", [0, 1], ids=["full", "sliding"])
 def test_attention_cached_fp32(layer_idx: int, text_config: InklingTextConfig) -> None:
     """Decode through SWA rollover and past the learned relative-bias extent."""
@@ -307,12 +308,14 @@ def test_attention_cached_fp32(layer_idx: int, text_config: InklingTextConfig) -
         allowed &= distance < text_config.sliding_window_size
     mask = torch.zeros(1, 1, 10, 10).masked_fill(~allowed, float("-inf"))
     expected, _ = reference(states, attention_mask=mask)
+    actual = actual.cuda()
     cache = MyInklingCache(text_config)
     chunks = [2] + [1] * 8
     start = 0
     for size in chunks:
         end = start + size
-        assert_fp32_close(actual(states[:, start:end], cache), expected[:, start:end])
+        output = actual(states[:, start:end].cuda(), cache).cpu()
+        assert_fp32_close(output, expected[:, start:end])
         start = end
 
 

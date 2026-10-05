@@ -35,7 +35,6 @@ class ShortConvLayerCache:
         config: "InklingTextConfig",
         is_kv_sconv: bool = True,
         is_swa: bool = True,
-        device: torch.device | str = "cpu",
     ):
         self.initialized = False
 
@@ -56,6 +55,9 @@ class ShortConvLayerCache:
         self.cache: Fp[T, "1 d conv_kernel_size"] | None = None
 
     def update_cache(self, tokens: Fp[T, "1 d s"]) -> Fp[T, "1 d conv_kernel_size"]:
+        """
+        Only ran during prefill
+        """
         if self.cache is None:
             self.cache = tokens.new_zeros(
                 (1, self.dim, self.conv_kernel_size), dtype=torch.float32
@@ -75,16 +77,12 @@ class FullAttentionLayerCache:
     Contains cache for full attention
     """
 
-    def __init__(
-        self,
-        config: "InklingTextConfig",
-        device: torch.device | str = "cpu",
-    ):
+    def __init__(self, config: "InklingTextConfig"):
         self.conv_caches = [
-            ShortConvLayerCache(config, is_kv_sconv=True, is_swa=False, device=device),
-            ShortConvLayerCache(config, is_kv_sconv=True, is_swa=False, device=device),
-            ShortConvLayerCache(config, is_kv_sconv=False, device=device),
-            ShortConvLayerCache(config, is_kv_sconv=False, device=device),
+            ShortConvLayerCache(config, is_kv_sconv=True, is_swa=False),
+            ShortConvLayerCache(config, is_kv_sconv=True, is_swa=False),
+            ShortConvLayerCache(config, is_kv_sconv=False),
+            ShortConvLayerCache(config, is_kv_sconv=False),
         ]
         self.kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
@@ -121,11 +119,7 @@ class FullAttentionLayerCache:
         while new_size > self.k_cache.shape[2]:
             self.extend_cache()
 
-        if key_states.is_cuda:
-            update_kv(key_states, value_states, self.k_cache, self.v_cache, old_size)
-        else:
-            self.k_cache[:, :, old_size:new_size, :] = key_states
-            self.v_cache[:, :, old_size:new_size, :] = value_states
+        update_kv(key_states, value_states, self.k_cache, self.v_cache, old_size)
 
         self.curr_size = new_size
         self.tokens_seen += seq_len
@@ -137,16 +131,12 @@ class SlidingWindowAttentionLayerCache:
     Contains cache for sliding window attention
     """
 
-    def __init__(
-        self,
-        config: "InklingTextConfig",
-        device: torch.device | str = "cpu",
-    ):
+    def __init__(self, config: "InklingTextConfig"):
         self.conv_caches = [
-            ShortConvLayerCache(config, is_kv_sconv=True, is_swa=True, device=device),
-            ShortConvLayerCache(config, is_kv_sconv=True, is_swa=True, device=device),
-            ShortConvLayerCache(config, is_kv_sconv=False, device=device),
-            ShortConvLayerCache(config, is_kv_sconv=False, device=device),
+            ShortConvLayerCache(config, is_kv_sconv=True, is_swa=True),
+            ShortConvLayerCache(config, is_kv_sconv=True, is_swa=True),
+            ShortConvLayerCache(config, is_kv_sconv=False),
+            ShortConvLayerCache(config, is_kv_sconv=False),
         ]
 
         self.sliding_window_size = config.sliding_window_size
@@ -177,18 +167,15 @@ class SlidingWindowAttentionLayerCache:
 
         self.curr_size = min(self.curr_size + roll_size, self.sliding_window_size)
 
-        if key_states.is_cuda:
-            update_kv(
-                key_states, value_states, self.k_cache, self.v_cache,
-                self.tokens_seen % self.sliding_window_size, self.sliding_window_size,
-            )
-        else:
-            # Mirror each position so rollover never needs to move existing tokens.
-            for i in range(roll_size):
-                position = (self.tokens_seen + i) % self.sliding_window_size
-                for offset in (position, position + self.sliding_window_size):
-                    self.k_cache[:, :, offset] = key_states[:, :, i]
-                    self.v_cache[:, :, offset] = value_states[:, :, i]
+        # Mirror each position so rollover never needs to move existing tokens.
+        update_kv(
+            key_states,
+            value_states,
+            self.k_cache,
+            self.v_cache,
+            self.tokens_seen % self.sliding_window_size,
+            self.sliding_window_size,
+        )
 
         self.tokens_seen += roll_size
 
@@ -202,18 +189,13 @@ class SlidingWindowAttentionLayerCache:
 
 
 class MyInklingCache:
-    def __init__(
-        self,
-        config: "InklingTextConfig",
-        device: torch.device | str = "cpu",
-    ):
+    def __init__(self, config: "InklingTextConfig"):
         layer_classes = {
             "hybrid": FullAttentionLayerCache,
             "hybrid_sliding": SlidingWindowAttentionLayerCache,
         }
         self.layers = [
-            layer_classes[layer_type](config, device=device)
-            for layer_type in config.layer_types
+            layer_classes[layer_type](config) for layer_type in config.layer_types
         ]
 
     def update_attn_cache(
