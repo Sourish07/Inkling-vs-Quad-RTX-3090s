@@ -127,3 +127,80 @@ def load_non_expert_state_dict(
                     del full, value
                 del converted
     return state
+
+
+def load_expert_state_dict(
+    model: torch.nn.Module,
+    checkpoint_dir: str | Path,
+    device_mesh: DeviceMesh,
+    gpu_expert_ids: set[int],
+) -> dict[str, dict[int, torch.Tensor]]:
+    """Load this rank's contiguous expert shard with per-expert CPU/GPU storage.
+
+    ``gpu_expert_ids`` contains global IDs, applied to every layer. Other experts
+    stay in pinned CPU memory. Requires a CUDA mesh. Every rank reads only its
+    shard from disk. Shard boundaries match DTensor's ``Shard(0)`` placement.
+
+    Returns ``{weight_name: {global_expert_id: tensor}}``. Mixed-device banks
+    cannot be loaded directly with ``model.load_state_dict``.
+    """
+    if device_mesh.ndim != 1:
+        raise ValueError("Pass the 1-D EP device mesh.")
+    if any(expert_id < 0 for expert_id in gpu_expert_ids):
+        raise ValueError("Expert IDs must be nonnegative.")
+    if device_mesh.device_type != "cuda":
+        raise ValueError("Expert loading requires a CUDA mesh.")
+    rank = device_mesh.get_local_rank()
+    device = torch.device("cuda", torch.cuda.current_device())
+    templates = model.state_dict()
+    state = {}
+    for file in sorted(Path(checkpoint_dir).glob("*.safetensors")):
+        if file.name == "mtp.safetensors":
+            continue
+        with safe_open(file, framework="pt", device="cpu") as handle:
+            for key in sorted(handle.keys()):
+                if (
+                    not key.startswith("model.llm.")
+                    or ".mlp.experts." not in key
+                    or key.endswith((".original_shape", ".input_amax"))
+                ):
+                    continue
+                tensor_slice = handle.get_slice(key)
+                shape = tensor_slice.get_shape()
+                names = convert_checkpoint_tensors(
+                    {key: torch.empty(shape, device="meta")}
+                )
+                names = [name for name in names if name in templates]
+                if not names:
+                    continue
+                num_experts = shape[0]
+                if any(expert_id >= num_experts for expert_id in gpu_expert_ids):
+                    raise ValueError(
+                        f"GPU expert IDs must be below {num_experts} for {key}."
+                    )
+                shard_size = (
+                    num_experts + device_mesh.size() - 1
+                ) // device_mesh.size()
+                start = min(rank * shard_size, num_experts)
+                end = min(start + shard_size, num_experts)
+                if start == end:
+                    state.update({name: {} for name in names})
+                    continue
+                converted = convert_checkpoint_tensors({key: tensor_slice[start:end]})
+                for name in names:
+                    target = templates[name]
+                    experts = {}
+                    for local_id, expert_id in enumerate(range(start, end)):
+                        weight = (
+                            converted[name][local_id]
+                            .to(dtype=target.dtype)
+                            .contiguous()
+                        )
+                        if expert_id in gpu_expert_ids:
+                            weight = weight.to(device)
+                        else:
+                            weight = weight.pin_memory()
+                        experts[expert_id] = weight
+                    state[name] = experts
+                del converted
+    return state
