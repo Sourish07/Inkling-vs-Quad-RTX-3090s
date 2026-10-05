@@ -126,7 +126,9 @@ def _update_kv(
     V_STRIDES: tl.constexpr,
     CAPACITY: tl.constexpr,
     START,
+    DEVICE_START: tl.constexpr,
     WINDOW: tl.constexpr,
+    MIRROR: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """
@@ -150,19 +152,20 @@ def _update_kv(
         i < HEADS * S * D,
         0,
     )
-    position = START + token
+    start = tl.load(START) if DEVICE_START else START
+    position = start + token
     if WINDOW:
         position %= WINDOW
     destination = (head * CAPACITY + position) * D + channel
     tl.store(KCache + destination, key, i < HEADS * S * D)
     tl.store(VCache + destination, value, i < HEADS * S * D)
-    if WINDOW:
+    if WINDOW and MIRROR:
         # Mirrored ring: the newest window is always a contiguous chronological view.
         tl.store(KCache + destination + WINDOW * D, key, i < HEADS * S * D)
         tl.store(VCache + destination + WINDOW * D, value, i < HEADS * S * D)
 
 
-def update_kv(key, value, k_cache, v_cache, start, window=0):
+def update_kv(key, value, k_cache, v_cache, start, window=0, mirror=True):
     assert key.shape[0] == 1
     _update_kv[(triton.cdiv(key.numel(), 256),)](
         key,
@@ -176,6 +179,8 @@ def update_kv(key, value, k_cache, v_cache, start, window=0):
         tuple(value.stride()),
         k_cache.shape[2],
         start,
+        isinstance(start, torch.Tensor),
         window,
+        mirror,
         256,
     )

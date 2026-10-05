@@ -1,0 +1,52 @@
+"""One complete greedy decode graph for a prefilled, batch-one request."""
+
+import torch
+import torch.distributed as dist
+
+
+class DecodeGraph:
+    @torch.inference_mode()
+    def __init__(self, model, cache, next_token, capacity):
+        assert next_token.is_cuda and next_token.shape == (1, 1)
+        assert not model.training
+        self.model = model
+        self.cache = cache
+        self.token = next_token.clone()
+        self.remaining = capacity - cache.layers[0].tokens_seen
+        cache.prepare_decode(capacity)
+        buffers = [self.token, *cache.decode_buffers()]
+        saved = [buffer.clone() for buffer in buffers]
+
+        def restore():
+            for buffer, original in zip(buffers, saved):
+                buffer.copy_(original)
+
+        # JIT kernels, cuBLAS and NCCL must be initialized before capture.
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                self._step()
+                restore()
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        if dist.is_initialized():
+            dist.barrier()
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph, stream=stream):
+            self._step()
+        restore()
+        torch.cuda.synchronize()
+
+    def _step(self):
+        self.logits = self.model(self.token, cache=self.cache)
+        torch.argmax(self.logits[:, -1], dim=-1, keepdim=True, out=self.token)
+        if dist.is_initialized():
+            dist.broadcast(self.token, src=0)
+
+    def replay(self):
+        # A host bound prevents out-of-range writes without reading GPU state.
+        assert self.remaining > 0, "decode graph capacity exhausted"
+        self.remaining -= 1
+        self.graph.replay()
+        return self.token

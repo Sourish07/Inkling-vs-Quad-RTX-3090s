@@ -14,6 +14,7 @@ from transformers import (
 )
 
 from my_inkling import MyInkling, MyInklingCache, apply_ep_plan, apply_tp_plan
+from my_inkling.decode_graph import DecodeGraph
 from utils import (
     Profiler,
     get_device_mesh,
@@ -102,6 +103,7 @@ def main(
     decode_start = 0.0
     num_decode_tokens = 0
     cache = MyInklingCache(config.text_config)
+    decode_graph = None
 
     # ENABLE_PROFILING=1 also enables it; only rank 0 records a trace.
     profiler = Profiler(enable=profile)
@@ -112,15 +114,27 @@ def main(
             # Names each forward pass in the profiler trace.
             label = "prefill" if step == 0 else f"decode_{step}"
             with record_function(label):
-                logits = model(next_input, cache=cache)
-            next_input = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            torch.distributed.broadcast(next_input, src=0)
+                if step == 0:
+                    logits = model(next_input, cache=cache)
+                    next_input = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                    torch.distributed.broadcast(next_input, src=0)
+                else:
+                    assert decode_graph is not None
+                    next_input = decode_graph.replay()
             if streamer is not None:
                 streamer.put(next_input.cpu())
             # .item() syncs the device, so the timestamps are accurate.
             is_eos = next_input.item() == tokenizer.eos_token_id
             if step == 0:
-                decode_start = time.perf_counter()
+                if not is_eos and max_new_tokens > 1:
+                    logger.info("Warming up and capturing complete decode CUDA graph")
+                    decode_graph = DecodeGraph(
+                        model,
+                        cache,
+                        next_input,
+                        capacity=num_tokens + max_new_tokens - 1,
+                    )
+                    decode_start = time.perf_counter()
             else:
                 num_decode_tokens += 1
             if is_eos:
@@ -137,6 +151,10 @@ def main(
             f"= {num_decode_tokens / decode_time:.2f} tok/s (excl. prefill)"
         )
 
+    # NCCL communicator shutdown waits for every captured graph to be released.
+    if decode_graph is not None:
+        torch.cuda.synchronize()
+        decode_graph.graph.reset()
     torch.distributed.destroy_process_group()
 
 
