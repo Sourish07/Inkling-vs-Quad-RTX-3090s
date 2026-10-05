@@ -2,28 +2,9 @@
 GPU cache planning and onload from CUDA-mapped pinned checkpoint tensors.
 """
 
-import ctypes
-
 import torch
 import triton
 import triton.language as tl
-
-
-def mapped_pointer(tensor):
-    """
-    Resolve pinned host storage once; its owning tensor must remain alive.
-    """
-    if tensor.is_cuda:
-        return tensor.data_ptr()
-    assert tensor.is_pinned() and tensor.is_contiguous()
-    driver = ctypes.CDLL("libcuda.so.1")
-    pointer = ctypes.c_uint64()
-    status = driver.cuMemHostGetDevicePointer_v2(
-        ctypes.byref(pointer), ctypes.c_void_p(tensor.data_ptr()), 0
-    )
-    if status:
-        raise RuntimeError(f"cuMemHostGetDevicePointer failed: {status}")
-    return pointer.value
 
 
 @triton.jit
@@ -167,8 +148,14 @@ class ExpertCache:
             )
             for name in names
         ]
+        # GPU kernels read host weights by address, so they must be pinned.
+        assert all(
+            w.is_contiguous() and (w.is_cuda or w.is_pinned())
+            for name in names
+            for w in weights[name].values()
+        )
         self.sources = torch.tensor(
-            [[mapped_pointer(weights[name][e]) for name in names] for e in ids],
+            [[weights[name][e].data_ptr() for name in names] for e in ids],
             dtype=torch.int64,
             device=device,
         )
