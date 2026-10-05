@@ -33,3 +33,15 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 - `run_naive.py` is now running at ~8.6 s/tok! (only benchmarked 8 token generation haha)
 - Probably can optimize away a couple redundant reallocations; i.e. `torch.roll` probably isn't ideal
 - Need to add support for subsequent prefills after the first
+
+## 3. Adding tensor parallelism
+
+- `_VocabParallelEmbedding` performs a distributed embedding lookup
+  - We cannot just use `RowwiseParallel` because we only want to split the embed lookup, and then ensure the all-reduce happens before the RMSNorm.  We need the lookup results combined before the RMSNorm.
+  - We can't wrap `MyInklingNormedEmbedding` with `RowwiseParallel` because of the all-reduce requirement. We can't wrap `MyInklingNormedEmbedding.weight` either because `RowwiseParallel` only works on `nn.Module`s, not `Parameter`s.
+  - `DTensor.from_local(..., Replicate())` declares replicated token IDs
+  - This is needed because we call `redistribute` (the all-reduce) afterwards
+- `_HeadParallelConv1d` performs a local convolution, with the split inputs & sharded weights
+  - `self.weight.to_local()` is used here because everything is done locally with no collectives needed
+- `_TPSharedExperts` is needed because shared experts use raw 3D parameters rather than `nn.Linear` modules
+- `run_naive.py` now running at ~7.45 s/tok!
