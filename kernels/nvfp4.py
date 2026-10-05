@@ -1,6 +1,21 @@
 """One-time preparation of a ModelOpt expert's packed checkpoint tensors."""
 
+from functools import lru_cache
+from pathlib import Path
+
 import torch
+
+
+@lru_cache(maxsize=1)
+def _load_cpu_prepare():
+    from torch.utils.cpp_extension import load
+
+    return load(
+        name="inkling_nvfp4_prepare_cpu",
+        sources=[str(Path(__file__).resolve().parent / "csrc/nvfp4_prepare.cpp")],
+        extra_cflags=["-O3", "-std=c++20"],
+        with_cuda=False,
+    )
 
 
 def prepare_nvfp4(
@@ -30,6 +45,11 @@ def prepare_nvfp4(
         raise ValueError("Checkpoint scale2 must be a scalar")
     if scale.device != weight.device or scale2.device != weight.device:
         raise ValueError("Checkpoint tensors must share a device")
+
+    if weight.device.type == "cpu":
+        return tuple(_load_cpu_prepare().prepare(
+            weight, scale, scale2, dtype == torch.bfloat16
+        ))
 
     # Unpack E2M1 codes, transpose to [K,N], and arrange tensor-core fragments.
     codes = torch.stack((weight & 15, weight >> 4), dim=-1).reshape(n, k).T

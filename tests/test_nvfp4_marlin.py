@@ -66,3 +66,24 @@ def test_preparation_preserves_interleaved_rows():
     lut = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6], device="cuda")
     expected = (lut[codes.long()] * 16).expand(3, 128)
     torch.testing.assert_close(output.float(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("strided", [False, True])
+def test_cpu_prepare_matches_cuda_for_all_finite_scales(dtype, strided):
+    # All finite E4M3 codes, including signed zero and subnormals. CUDA
+    # retains the PyTorch reference path, independent of the CPU direct packer.
+    n, k = 256, 128
+    weight = torch.randint(256, (n, k // 2), dtype=torch.uint8)
+    bits = torch.arange(n * k // 16) % 254
+    scale = (bits + (bits >= 127)).to(torch.uint8)
+    scale = scale.reshape(n, k // 16).view(torch.float8_e4m3fn)
+    scale2 = torch.tensor(0.125)
+    if strided:
+        # Same logical layout, with non-contiguous source strides.
+        weight = weight.T.contiguous().T
+        scale = scale.T.contiguous().T
+    actual = prepare_nvfp4(weight, scale, scale2, dtype=dtype)
+    expected = prepare_nvfp4(weight.cuda(), scale.cuda(), scale2.cuda(), dtype=dtype)
+    for cpu, gpu in zip(actual, expected):
+        assert torch.equal(cpu.view(torch.uint8), gpu.cpu().view(torch.uint8))

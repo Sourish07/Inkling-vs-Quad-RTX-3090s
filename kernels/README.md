@@ -44,6 +44,9 @@ three tensors in the ModelOpt NVFP4 checkpoint format:
 
 Preparation works on CPU or CUDA, preserves output row order and the packed
 weight/scale storage size, and preserves CPU pinning for asynchronous onload.
+CPU preparation uses a direct C++ packer that writes final packed weights and
+scales without unpacked, transposed, or int64 intermediate tensors. Pinned
+outputs are allocated directly. CUDA preparation retains its PyTorch path.
 N must be a positive multiple of 128, and K a positive multiple of 64. There
 is no padding or automatic dequantization fallback. Both FP16 and BF16
 activations are supported; prepare separately if changing activation dtype.
@@ -57,7 +60,9 @@ banks in checkpoint layout. Prepared tensors must not be passed to that path.
 Requires PyTorch, Ninja, a CUDA toolkit with `nvcc`, a C++20 compiler, and an
 Ampere-or-newer GPU. No SGLang, `sgl_kernel`, or TVM FFI package is required.
 Run through `uv run --frozen` so Ninja is on PATH. The extension is compiled
-lazily and cached by activation dtype and GPU architecture.
+lazily and cached by activation dtype and GPU architecture. CPU preparation
+has a separate C++ extension, compiled once and shared by both activation
+dtypes and all ranks through the PyTorch extension cache.
 
 ```sh
 MAX_JOBS=2 uv run --frozen -m pytest tests/test_nvfp4_marlin.py -q
@@ -66,6 +71,14 @@ MAX_JOBS=2 uv run --frozen -m pytest tests/test_nvfp4_marlin.py -q
 Tests compare with ModelOpt dequantization plus PyTorch linear, cover FP16/BF16,
 CPU/GPU preparation, pinned onload into reused slots, empty and padded token
 batches, a non-default CUDA stream, and preservation of interleaved gate/up rows.
+
+With four RTX 3090 ranks, single-thread CPU execution, and a warm extension
+cache, a preparation benchmark with 64 experts per rank (24 GPU, 40 CPU) took
+14.8–15.0 seconds per layer with the original PyTorch CPU path and 0.72–0.73
+seconds with the direct packer. It used checkpoint-derived gate/up `[4096,
+4096]` and down `[4096, 2048]` matrices replicated into independent expert
+allocations. These timings cover preparation; checkpoint I/O and first-time
+compilation are outside the measurement.
 
 ## Source provenance
 
@@ -86,3 +99,4 @@ preparation), `csrc/bindings.cpp`, and `csrc/nvfp4_moe.cu` (four-tensor binding)
 `csrc/nvfp4_dispatch.cuh` adapts the original host dispatcher to NVFP4 only.
 `csrc/include/sgl_kernel/utils.cuh` supplies minimal PyTorch/CUDA host helpers,
 replacing TVM-dependent utilities in the compilation include path.
+`csrc/nvfp4_prepare.cpp` implements direct CPU checkpoint preparation.
