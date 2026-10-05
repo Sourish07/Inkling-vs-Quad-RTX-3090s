@@ -1,4 +1,5 @@
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import tyro
@@ -97,6 +98,8 @@ def main(
     streamer = (
         TextStreamer(tokenizer, skip_special_tokens=True) if local_rank == 0 else None
     )
+    output_pool = ThreadPoolExecutor(max_workers=1) if streamer is not None else None
+    output_future = None
     next_input = inputs["input_ids"]
 
     # Step 0 is prefill (+ first token); the decode clock starts after it.
@@ -121,10 +124,13 @@ def main(
                 else:
                     assert decode_graph is not None
                     next_input = decode_graph.replay()
+            host_token = next_input.cpu()
             if streamer is not None:
-                streamer.put(next_input.cpu())
-            # .item() syncs the device, so the timestamps are accurate.
-            is_eos = next_input.item() == tokenizer.eos_token_id
+                assert output_pool is not None
+                if output_future is not None:
+                    output_future.result()
+                output_future = output_pool.submit(streamer.put, host_token)
+            is_eos = host_token.item() == tokenizer.eos_token_id
             if step == 0:
                 if not is_eos and max_new_tokens > 1:
                     logger.info("Warming up and capturing complete decode CUDA graph")
@@ -140,11 +146,14 @@ def main(
             if is_eos:
                 break
 
+    if streamer is not None:
+        assert output_pool is not None and output_future is not None
+        output_future.result()
+        output_pool.shutdown()
+        streamer.end()
     decode_time = time.perf_counter() - decode_start
     profiler.stop()
     profiler.export_chrome_trace("trace.json.gz")
-    if streamer is not None:
-        streamer.end()
     if local_rank == 0 and num_decode_tokens > 0:
         logger.info(
             f"Decode: {num_decode_tokens} tokens in {decode_time:.2f}s "
