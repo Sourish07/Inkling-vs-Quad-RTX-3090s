@@ -5,6 +5,7 @@ import tyro
 from huggingface_hub import snapshot_download
 from loguru import logger
 from torch.distributed import get_world_size
+from torch.profiler import record_function
 from transformers import (
     AutoTokenizer,
     BatchEncoding,
@@ -107,7 +108,10 @@ def main(
 
     with torch.inference_mode():
         for step in range(max_new_tokens):
-            logits = model(next_input, cache=cache)
+            # Names each forward pass in the profiler trace.
+            label = "prefill" if step == 0 else f"decode_{step}"
+            with record_function(label):
+                logits = model(next_input, cache=cache)
             next_input = logits[:, -1, :].argmax(dim=-1, keepdim=True)
             torch.distributed.broadcast(next_input, src=0)
             if streamer is not None:
