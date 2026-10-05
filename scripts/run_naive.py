@@ -301,6 +301,7 @@ def load_weights(
                     execution_device=device,
                     offload_buffers=True,
                 )
+    model.fuse_attention_projections()
     return model
 
 
