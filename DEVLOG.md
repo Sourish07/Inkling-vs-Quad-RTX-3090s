@@ -37,8 +37,10 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 ## 3. Adding tensor parallelism
 
 - `_VocabParallelEmbedding` performs a distributed embedding lookup
-  - We cannot just use `RowwiseParallel` because we only want to split the embed lookup, then all-reduce, and then perform the RMSNorm like normal. `RowwiseParallel` only works on `nn.Module`, not the `weight` parameter in `nn.Embedding`
-  - `DTensor.from_local` is needed because we call `redistribute` (the all-reduce) afterwards
+  - We cannot just use `RowwiseParallel` because we only want to split the embed lookup, and then ensure the all-reduce happens before the RMSNorm.  We need the lookup results combined before the RMSNorm.
+  - We can't wrap `MyInklingNormedEmbedding` with `RowwiseParallel` because of the all-reduce requirement. We can't wrap `MyInklingNormedEmbedding.weight` either because `RowwiseParallel` only works on `nn.Module`s, not `Parameter`s.
+  - `DTensor.from_local(..., Replicate())` declares replicated token IDs
+  - This is needed because we call `redistribute` (the all-reduce) afterwards
 - `_HeadParallelConv1d` performs a local convolution, with the split inputs & sharded weights
   - `self.weight.to_local()` is used here because everything is done locally with no collectives needed
 - `_TPSharedExperts` is needed because shared experts use raw 3D parameters rather than `nn.Linear` modules
