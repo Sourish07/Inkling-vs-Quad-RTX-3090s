@@ -1,4 +1,6 @@
-"""Cache converted TP shards and mixed-device EP weights, without model changes."""
+"""
+Cache converted TP shards and mixed-device EP weights, without model changes.
+"""
 
 import hashlib
 import json
@@ -14,7 +16,9 @@ from loguru import logger
 
 
 def cache_directory(model, checkpoint_dir, mesh, *, experts=False, gpu_experts=None):
-    """Invalidate on source changes, local layout, dtypes, or EP placement changes."""
+    """
+    Invalidate on source changes, local layout, dtypes, or EP placement changes.
+    """
     if os.environ.get("INKLING_FLASHPACK_CACHE") == "0":
         return None
     checkpoint_dir = Path(checkpoint_dir).resolve()
@@ -53,7 +57,9 @@ def cache_directory(model, checkpoint_dir, mesh, *, experts=False, gpu_experts=N
 
 
 def cache_ready(directory, mesh, device, *, experts=False):
-    """Agree before TP fallback: partial caches must never split collective paths."""
+    """
+    Agree before TP fallback: partial caches must never split collective paths.
+    """
     if directory is None:
         return False
     files = [directory / f"rank-{rank}.flashpack" for rank in range(mesh.size())]
@@ -76,7 +82,9 @@ def save_pack(state, path):
 
 
 def _layout(path):
-    """Return a pack's macroblocks as (dtype, byte offset, bytes) and its records."""
+    """
+    Return a pack's macroblocks as (dtype, byte offset, bytes) and its records.
+    """
     metadata = get_flashpack_file_metadata(str(path))
     if "macroblocks" in metadata:
         blocks = [
@@ -92,7 +100,8 @@ def _layout(path):
 
 @contextmanager
 def _direct_reader(path):
-    """Yield fill(start, target): copy file bytes at start into a uint8 tensor.
+    """
+    Yield fill(start, target): copy file bytes at start into a uint8 tensor.
 
     FlashPack's own readers are avoided. Faulting a pack in through mmap is
     several times slower than the disk and its page cache competes with the
@@ -137,7 +146,9 @@ def _direct_reader(path):
 
 
 def load_pack(path, device):
-    """Read a pack onto device; tensors are views of one block per dtype."""
+    """
+    Read a pack onto device; tensors are views of one block per dtype.
+    """
     blocks, records = _layout(path)
     storage = []
     with _direct_reader(path) as fill:
@@ -154,7 +165,9 @@ def load_pack(path, device):
 
 
 def read_pinned_pack(path):
-    """Yield a pack's tensors, each in its own pinned allocation."""
+    """
+    Yield a pack's tensors, each in its own pinned allocation.
+    """
     blocks, records = _layout(path)
 
     def span(record):
