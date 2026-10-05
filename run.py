@@ -108,7 +108,6 @@ def main(
     cache = MyInklingCache(config.text_config)
     decode_graph = None
 
-    # ENABLE_PROFILING=1 also enables it; only rank 0 records a trace.
     profiler = Profiler(enable=profile)
     profiler.start()
 
