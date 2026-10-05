@@ -46,11 +46,17 @@ class OffloadedExperts(nn.Module):
         self.device_mesh = device_mesh
         self.weights = weights
 
-        num_cpu_experts = sum(
-            w.device.type == "cpu" for w in weights["down_proj"].values()
-        )
+        # stores which experts are GPU pinned or in CPU memory
+        self.cpu_expert_ids = {
+            e for e, w in weights["down_proj"].items() if w.device.type == "cpu"
+        }
+        self.gpu_expert_ids = {
+            e for e, w in weights["down_proj"].items() if w.device.type == "cuda"
+        }
+        # all experts that belong to this rank
+        self.local_expert_ids = self.cpu_expert_ids | self.gpu_expert_ids
 
-        self.num_slots = min(num_slots, num_cpu_experts)
+        self.num_slots = min(num_slots, len(self.cpu_expert_ids))
         device = torch.device("cuda", torch.cuda.current_device())
 
         # Iterates over the 6 weight banks (proj, scale, scale2) * (gate_up, down)
@@ -163,14 +169,11 @@ class OffloadedExperts(nn.Module):
         expert_ids = [
             e
             for e in torch.unique(top_k_index).tolist()
-            if e in self.weights["down_proj"]
+            if e in self.local_expert_ids
         ]
-        # `if e in self.weights["down_proj"]` == False means expert doesn't belong to this rank
 
         # prefetch only non-gpu pinned experts
-        self.prefetch(
-            [e for e in expert_ids if self.weights["down_proj"][e].device.type == "cpu"]
-        )
+        self.prefetch([e for e in expert_ids if e in self.cpu_expert_ids])
         for expert_id in expert_ids:
             token_idx, top_k_pos = torch.where(top_k_index == expert_id)
             projected = F.linear(
