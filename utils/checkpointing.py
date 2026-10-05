@@ -5,11 +5,21 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+from loguru import logger
 from safetensors import safe_open
 from torch.distributed.device_mesh import DeviceMesh
 from transformers import AutoConfig
 from transformers.conversion_mapping import get_checkpoint_conversion_mapping
 from transformers.core_model_loading import WeightConverter, WeightRenaming
+
+from utils.flashpack_cache import (
+    cache_directory,
+    cache_ready,
+    load_experts,
+    load_pack,
+    save_experts,
+    save_pack,
+)
 
 
 def convert_checkpoint_tensors(
@@ -95,7 +105,7 @@ def load_non_expert_state_dict(
     model: torch.nn.Module, checkpoint_dir: str | Path, device_mesh: DeviceMesh
 ) -> dict[str, torch.Tensor]:
     """
-    Read non-expert weights on rank 0; scatter shards and broadcast replicas.
+    Load a cached rank-local pack, or scatter/broadcast from rank 0 and cache.
     """
     rank = device_mesh.get_local_rank()
     group = device_mesh.get_group()
@@ -104,6 +114,10 @@ def load_non_expert_state_dict(
         if device_mesh.device_type == "cuda"
         else torch.device(device_mesh.device_type)
     )
+    cache = cache_directory(model, checkpoint_dir, device_mesh)
+    if cache_ready(cache, device_mesh, device):
+        logger.info("Loading rank {} non-experts from FlashPack cache {}", rank, cache)
+        return load_pack(cache / f"rank-{rank}.flashpack", device)
     templates = model.state_dict()
     state = {}
     for handle, key in _llm_tensors(checkpoint_dir, str(device), experts=False):
@@ -145,6 +159,8 @@ def load_non_expert_state_dict(
             if rank == 0:
                 del full
         del converted
+    if cache is not None:
+        save_pack(state, cache / f"rank-{rank}.flashpack")
     return state
 
 
@@ -165,9 +181,21 @@ def load_expert_state_dict(
     remain packed, with their ``_scale`` and ``_scale2`` tensors preserved.
     Layers stored unquantized have no scale banks. Either way, gate/up rows
     stay interleaved as in the checkpoint.
+
+    Complete FlashPack caches bypass conversion and sharding. Cache misses use
+    the original flow above, then save GPU packs and a shared CPU-expert pack.
     """
     rank = device_mesh.get_local_rank()
     device = torch.device("cuda", torch.cuda.current_device())
+    cache = cache_directory(
+        model,
+        checkpoint_dir,
+        device_mesh,
+        experts=True,
+        gpu_experts=gpu_experts_per_rank,
+    )
+    if cache_ready(cache, device_mesh, device, experts=True):
+        return load_experts(cache, device_mesh, device)
     templates = model.state_dict()
     state = {}
     for handle, key in _llm_tensors(checkpoint_dir, "cpu", experts=True):
@@ -189,4 +217,6 @@ def load_expert_state_dict(
                 for local_id, weight in enumerate(bank)
             }
         del converted
+    if cache is not None:
+        save_experts(state, cache, device_mesh)
     return state
