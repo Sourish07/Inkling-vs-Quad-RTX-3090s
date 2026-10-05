@@ -32,12 +32,17 @@ def _plan(
     R: tl.constexpr,
 ):
     """
-    Group routes by expert, assign LRU slots to cache misses, write the pointer table.
+    Groups token routing by expert, assign LRU slots to cache misses, write to the pointer table.
 
     Runs as one program so all decisions see the same cache state. Planning on
-    the GPU means the host never downloads expert IDs (a forced sync) and never
+    the GPU means the host never downloads (from GPU) expert IDs (a forced sync) and never
     rebuilds or uploads the pointer table.
+
+    Params:
+        Clock: just an int that gets incremented every time the kernel runs, used to update Ages
     """
+    # Step 1: count number of tokens routed to each expert; mark active experts
+    # we're simply consuming the output of TopKRouter
     e = tl.arange(0, E)
     s = tl.arange(0, S)
     r = tl.arange(0, R)
@@ -49,6 +54,8 @@ def _plan(
     )
     counts = tl.sum(matches.to(tl.int32), 1)
     active = counts > 0
+
+    # Step 2: LRU; assign slots to cache misses
     resident = tl.load(Resident + e, e < LOCAL, 0) != 0
     cached = tl.load(SlotExperts + s, s < SLOTS, -1)
     hits = (cached[None, :] == e[:, None]) & (s[None, :] < SLOTS)
@@ -78,8 +85,9 @@ def _plan(
     tl.store(CopyExperts + s, copy_expert, s < SLOTS)
     tl.store(Clock, tick)
 
-    # Compact active experts into a bounded GPU group list. Decode launches at
-    # most top_k groups; prefill can launch all local experts without host reads.
+    # Step 3: Compact active experts into a bounded GPU group list
+    # Decode launches at most top_k groups; prefill can launch all local experts without host reads.
+    # used to be _route previous, logic is ported here (stream compaction)
     group = tl.cumsum(active.to(tl.int32)) - 1
     tl.store(Experts + e, -1, e < LOCAL)
     tl.store(Counts + e, 0, e < LOCAL)
@@ -89,7 +97,7 @@ def _plan(
     positions = tl.cumsum(matches.to(tl.int32), 1) - 1
     tl.store(Rows + group[:, None] * CAPACITY + positions, r[None, :], matches)
 
-    # loop that updates the pointer table
+    # Step 4: loop that updates the pointer table
     for bank in tl.static_range(STRIDE):
         source = tl.load(Sources + e * STRIDE + bank, e < LOCAL, 0)
         destination = tl.load(

@@ -149,6 +149,9 @@ def _reduce(
 class GroupedExperts:
     """
     Reusable pointer table, routing workspace and projection scratch for one layer.
+    - Pointer table: self.pointers
+    - Routing workspace: self.experts, self.counts, self.rows
+    - Projection scratch: self.gate_up, self.activated, self.down
 
     Calls run sequentially on the module's compute stream. The output is owned
     by the caller; internal buffers are overwritten on the next call.
@@ -233,6 +236,7 @@ class GroupedExperts:
                 64,
                 64,
             )
+            # TODO: I can probably fuse
             if projection == 0:
                 projected = self.gate_up[:routes]
                 torch.mul(
