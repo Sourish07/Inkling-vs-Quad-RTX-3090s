@@ -56,3 +56,21 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 - Checkpoint loading is still kinda slow; We need to optimize that
 - Because we use TP for the non-expert layers, all expert layers receive the same input. No all2all necessary
 - `run.py` is running at ~2.6 tok/s!
+
+## 5. Adding expert caching for non-GPU experts
+
+- First time implementing this feature and I didn't really have any good open source references
+- Main new features:
+  - Keep track of which experts are pinned to GPU vs not
+  - Allocate slots for all "weight banks", i.e. (proj, scale, scale2) * (gate_up, down)
+  - Uses separate copy stream to overlap data transfer with computation
+  - Run prefetch for experts before entering the main expert loop in `forward`
+  - Expert `gate` and `up` weights are interleaved
+
+## 6. Removing DTensor
+
+- This one was a little surprising... I just took some old implementation of my RowLinear & ColumnLinear classes and threw them in here; It's faster!
+- `run.py` is now running at ~4.39 tok/s
+- `_VocabParallelEmbedding` is present for the same previous reason (i.e. the RMSNorm needs its inputs all-reduced)
+- `_TPSharedExperts` because the weights aren't `nn.Linear` modules, but rather just raw weight tensors
+- `_HeadParallelConv1d` because `local_channels` is `total_channels // world_size`

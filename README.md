@@ -11,7 +11,9 @@ List of optimizations:
   - Speed: 7.45 s/tok
 - 4. Expert Parallelism + CPU offloading (no expert caching)
   - Speed: 2.6 tok/s
-- 5. Expert caching
+- 5. CPU-expert caching
   - Speed: 3.28 tok/s
+- 6. Removing DTensor interface
+  - Speed: 4.39 tok/s
  
 Please read [DEVLOG.md](DEVLOG.md) for more details about my journey.
