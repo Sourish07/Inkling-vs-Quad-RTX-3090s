@@ -85,8 +85,7 @@ decode_start = 0.0
 num_decode_tokens = 0
 cache = MyInklingCache(config.text_config, device=device)
 
-# DTensor shared-expert views require no_grad with the installed PyTorch version.
-with torch.no_grad():
+with torch.inference_mode():
     for step in range(max_new_tokens):
         logits = model(next_input, cache=cache)
         next_input = logits[:, -1, :].argmax(dim=-1, keepdim=True)

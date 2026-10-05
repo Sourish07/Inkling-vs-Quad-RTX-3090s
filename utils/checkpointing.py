@@ -4,9 +4,9 @@ import json
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from safetensors import safe_open
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor, Replicate, distribute_tensor
 from transformers import AutoConfig
 from transformers.conversion_mapping import get_checkpoint_conversion_mapping
 from transformers.core_model_loading import WeightConverter, WeightRenaming
@@ -95,12 +95,10 @@ def load_non_expert_state_dict(
     model: torch.nn.Module, checkpoint_dir: str | Path, device_mesh: DeviceMesh
 ) -> dict[str, torch.Tensor]:
     """
-    Read dense and shared-expert weights on rank 0, then shard and distribute.
-
-    Routed expert banks are excluded. Shared experts use the DTensor placements
-    installed by ``apply_tp_plan``, including converted gate/up tensors.
+    Read non-expert weights on rank 0; scatter shards and broadcast replicas.
     """
     rank = device_mesh.get_local_rank()
+    group = device_mesh.get_group()
     device = (
         torch.device("cuda", torch.cuda.current_device())
         if device_mesh.device_type == "cuda"
@@ -123,16 +121,29 @@ def load_non_expert_state_dict(
         )
         for name in names:
             target = templates[name]
-            distributed = isinstance(target, DTensor)
-            placements = target.placements if distributed else [Replicate()]
-            full = (
-                converted[name].to(dtype=target.dtype).contiguous()
-                if rank == 0
-                else torch.empty(target.shape, dtype=target.dtype, device=device)
-            )
-            value = distribute_tensor(full, device_mesh, placements, src_data_rank=0)
-            state[name] = value if distributed else value.to_local()
-            del full, value
+            module_name, _, parameter_name = name.rpartition(".")
+            module = model.get_submodule(module_name)
+            shard_dim = getattr(module, "_tp_shard_dims", {}).get(parameter_name)
+            if rank == 0:
+                full = converted[name].to(dtype=target.dtype).contiguous()
+            if shard_dim is None:
+                value = full if rank == 0 else torch.empty_like(target, device=device)
+                dist.broadcast(value, src=0, group=group)
+            else:
+                value = torch.empty_like(target, device=device)
+                shards = (
+                    [
+                        chunk.contiguous()
+                        for chunk in full.chunk(device_mesh.size(), dim=shard_dim)
+                    ]
+                    if rank == 0
+                    else None
+                )
+                dist.scatter(value, scatter_list=shards, src=0, group=group)
+                del shards
+            state[name] = value
+            if rank == 0:
+                del full
         del converted
     return state
 
@@ -147,7 +158,7 @@ def load_expert_state_dict(
 
     The first ``gpu_experts_per_rank`` experts of each bank's shard go to this
     rank's GPU; the rest stay in pinned CPU memory. Every rank reads only its
-    shard from disk. Shard boundaries match DTensor's ``Shard(0)`` placement.
+    shard from disk.
 
     Returns ``{weight_name: {global_expert_id: tensor}}``. Mixed-device banks
     cannot be loaded directly with ``model.load_state_dict``. NVFP4 weights

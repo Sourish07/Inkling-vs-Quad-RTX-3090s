@@ -1,17 +1,14 @@
-"""Tensor parallelism for Inkling's text tower (routed experts stay replicated)."""
+"""
+Local tensor parallelism; all sharded dimensions must divide evenly.
+"""
 
 import torch
+import torch.distributed as dist
 from jaxtyping import Float as Fp
 from jaxtyping import Int
 from torch import Tensor as T
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
-from torch.distributed.tensor.parallel import (
-    ColwiseParallel,
-    RowwiseParallel,
-    parallelize_module,
-)
 from torch.nn import functional as F
 
 from .model import (
@@ -25,138 +22,171 @@ from .model import (
 )
 
 
+def _shard_parameter(
+    module: nn.Module, name: str, weight: T, dim: int, mesh: DeviceMesh
+):
+    """
+    Copy the local shard and record its dimension for checkpoint loading.
+    """
+    size = weight.shape[dim] // mesh.size()
+    local = (
+        weight.detach()
+        .narrow(dim, mesh.get_local_rank() * size, size)
+        .clone()
+        .contiguous()
+    )
+    module.register_parameter(
+        name, nn.Parameter(local, requires_grad=weight.requires_grad)
+    )
+    if not hasattr(module, "_tp_shard_dims"):
+        module._tp_shard_dims = {}
+    # Used to determine which dimension to shard along when loading checkpoints.
+    module._tp_shard_dims[name] = dim
+
+
+class RowLinear(nn.Linear):
+    """
+    Project an already-sharded input and sum the outputs.
+    """
+
+    def __init__(self, linear: nn.Linear, device_mesh: DeviceMesh):
+        super().__init__(
+            linear.in_features // device_mesh.size(),
+            linear.out_features,
+            bias=False,
+            device="meta",
+            dtype=linear.weight.dtype,
+        )
+        self.device_mesh = device_mesh
+        _shard_parameter(self, "weight", linear.weight, 1, device_mesh)
+
+    def forward(self, x: T) -> T:
+        output = super().forward(x)
+        dist.all_reduce(output, group=self.device_mesh.get_group())
+        return output
+
+
+class ColumnLinear(nn.Linear):
+    """
+    Project replicated inputs; optionally gather the output shards.
+    """
+
+    def __init__(
+        self, linear: nn.Linear, device_mesh: DeviceMesh, sync_after_forward=False
+    ):
+        self.tp_size = device_mesh.size()
+        super().__init__(
+            linear.in_features,
+            linear.out_features // self.tp_size,
+            bias=False,
+            device="meta",
+            dtype=linear.weight.dtype,
+        )
+        self.device_mesh = device_mesh
+        self.sync_after_forward = sync_after_forward
+        _shard_parameter(self, "weight", linear.weight, 0, device_mesh)
+
+    def forward(self, x: T) -> T:
+        output = super().forward(x)
+        if self.sync_after_forward:
+            outputs = [torch.empty_like(output) for _ in range(self.tp_size)]
+            dist.all_gather(outputs, output, group=self.device_mesh.get_group())
+            output = torch.cat(outputs, dim=-1)
+        return output
+
+
 class _VocabParallelEmbedding(MyInklingNormedEmbedding):
     """
-    Reduce vocabulary-sharded lookups *before* Inkling's embedding RMSNorm.
-
-    Equivalent to Row-wise Parallel, i.e. the inputs are split and the outputs are all-reduced
+    Sum local vocabulary lookups before embedding RMSNorm.
     """
 
-    def __init__(self, embedding: MyInklingNormedEmbedding, mesh: DeviceMesh):
-        super().__init__(
-            embedding.num_embeddings,
+    def __init__(self, embedding: MyInklingNormedEmbedding, device_mesh: DeviceMesh):
+        nn.Embedding.__init__(
+            self,
+            embedding.num_embeddings // device_mesh.size(),
             embedding.embedding_dim,
-            embedding.padding_idx,
-            embedding.embed_norm.variance_epsilon,
+            device="meta",
+            dtype=embedding.weight.dtype,
         )
-        # embedding.weight originally is [vocab_size, hidden_size]
-        self.weight = nn.Parameter(
-            distribute_tensor(embedding.weight, mesh, [Shard(0)], src_data_rank=None),
-            requires_grad=embedding.weight.requires_grad,
-        )
+        _shard_parameter(self, "weight", embedding.weight, 0, device_mesh)
+        self.vocab_start = device_mesh.get_local_rank() * self.num_embeddings
         self.embed_norm = embedding.embed_norm
-        self.device_mesh = mesh
+        self.device_mesh = device_mesh
 
     def forward(self, input_ids: Int[T, "bs s"]) -> Fp[T, "bs s d"]:
-        # Explicitly declaring that `input_ids` is replicated across the mesh by `Replicate()`
-        input_ids = DTensor.from_local(
-            input_ids, self.device_mesh, [Replicate()], run_check=False
-        )
-        # DTensor handles the splitting of the inputs since self.weight is sharded along `vocab_size` dim
-        embeddings: DTensor = F.embedding(input_ids, self.weight, self.padding_idx)
+        local_ids = input_ids - self.vocab_start
+        outside = (local_ids < 0) | (local_ids >= self.num_embeddings)
+        embeddings = F.embedding(local_ids.masked_fill(outside, 0), self.weight)
+        embeddings.masked_fill_(outside.unsqueeze(-1), 0)
 
-        # Redistribute to `Replicate()` placement to match `embed_norm` input
-        # All-reduce is performed implicitly during `redistribute`
-        embeddings = embeddings.redistribute(placements=[Replicate()]).to_local()
+        dist.all_reduce(embeddings, group=self.device_mesh.get_group())
+
         return self.embed_norm(embeddings)
 
 
 class _TPSharedExperts(MyInklingSharedExperts):
-    """Shard shared-expert intermediate features and reduce their partial output."""
+    """
+    Shard intermediate features and sum partial shared-expert outputs.
+    Necessary because shared experts are all stored in one tensor and used in torch.bmm
+    """
 
-    def __init__(self, shared: MyInklingSharedExperts, mesh: DeviceMesh):
+    def __init__(self, shared: MyInklingSharedExperts, device_mesh: DeviceMesh):
         nn.Module.__init__(self)
         self.n_shared_experts = shared.n_shared_experts
         self.act_fn = shared.act_fn
-        self.device_mesh = mesh
+        self.device_mesh = device_mesh
         for name, dim in (("gate_proj", 1), ("up_proj", 1), ("down_proj", 2)):
-            weight = getattr(shared, name)
-            self.register_parameter(
-                name,
-                nn.Parameter(
-                    distribute_tensor(weight, mesh, [Shard(dim)], src_data_rank=None),
-                    requires_grad=weight.requires_grad,
-                ),
-            )
-        self.train(shared.training)
+            _shard_parameter(self, name, getattr(shared, name), dim, device_mesh)
 
     def forward(
         self, hidden_states: Fp[T, "bs s d"], gammas: Fp[T, "bs*s e_s"]
     ) -> Fp[T, "bs s d"]:
-        hidden_states = DTensor.from_local(
-            hidden_states, self.device_mesh, [Replicate()], run_check=False
-        )
-        gammas = DTensor.from_local(
-            gammas, self.device_mesh, [Replicate()], run_check=False
-        )
         output = super().forward(hidden_states, gammas)
-        assert isinstance(output, DTensor)
-        return output.redistribute(placements=[Replicate()]).to_local()
+        dist.all_reduce(output, group=self.device_mesh.get_group())
+        return output
 
 
 class _HeadParallelConv1d(nn.Conv1d):
-    """Keep global DTensor weights, but convolve only this rank's K/V channels."""
+    """
+    Convolve this rank's K/V channels.
+    """
 
-    weight: DTensor  # Overriding type for ty
-
-    def __init__(self, conv: nn.Conv1d, mesh: DeviceMesh):
-        local_channels = conv.in_channels // mesh.size()
+    def __init__(self, conv: nn.Conv1d, device_mesh: DeviceMesh):
+        channels = conv.in_channels // device_mesh.size()
         super().__init__(
-            local_channels,
-            local_channels,
+            channels,
+            channels,
             conv.kernel_size,
             stride=conv.stride,
             padding=conv.padding,
             dilation=conv.dilation,
-            groups=local_channels,
+            groups=channels,
             bias=False,
             padding_mode=conv.padding_mode,
             device="meta",
             dtype=conv.weight.dtype,
         )
-        self.weight = nn.Parameter(
-            distribute_tensor(conv.weight, mesh, [Shard(0)], src_data_rank=None),
-            requires_grad=conv.weight.requires_grad,
-        )
-
-    def forward(self, input: Fp[T, "bs d//ws s_in"]) -> Fp[T, "bs d//ws s_out"]:
-        """Convolve local K/V channels; output length depends on the padding."""
-        return self._conv_forward(input, self.weight.to_local(), self.bias)
+        _shard_parameter(self, "weight", conv.weight, 0, device_mesh)
 
 
 def apply_tp_plan(
     model: MyInkling, config: InklingConfig, device_mesh: DeviceMesh
 ) -> MyInkling:
     """
-    Apply TP to a meta model and update config's Q/KV counts to local heads.
-
-    Construct caches normally with ``MyInklingCache(config.text_config)`` after
-    applying TP. Hidden size, vocabulary size, per-head dimensions, and expert
-    settings retain their existing values.
+    Install local shards before checkpoint loading; update head counts for caches.
     """
     tp_size = device_mesh.size()
-    tower = model.model.language_model
-
     if tp_size == 1:
         return model
-
-    with torch.device("meta"):
-        tower.embed_tokens = _VocabParallelEmbedding(tower.embed_tokens, device_mesh)
-
+    tower = model.model.language_model
+    tower.embed_tokens = _VocabParallelEmbedding(tower.embed_tokens, device_mesh)
     for layer in tower.layers:
         attention: MyInklingAttention = layer.self_attn
-        parallelize_module(
-            attention,
-            device_mesh,
-            {
-                "q_proj": ColwiseParallel(),
-                "k_proj": ColwiseParallel(),
-                "v_proj": ColwiseParallel(),
-                "r_proj": ColwiseParallel(),
-                "o_proj": RowwiseParallel(),
-            },
-            src_data_rank=None,
-        )
+        for name in ("q_proj", "k_proj", "v_proj", "r_proj"):
+            setattr(
+                attention, name, ColumnLinear(getattr(attention, name), device_mesh)
+            )
+        attention.o_proj = RowLinear(attention.o_proj, device_mesh)
         attention.num_heads //= tp_size
         attention.num_key_value_heads //= tp_size
 
@@ -165,30 +195,23 @@ def apply_tp_plan(
             short_conv.dim //= tp_size
 
         if isinstance(layer.mlp, MyInklingMLP):
-            parallelize_module(
-                layer.mlp,
-                device_mesh,
-                {
-                    "gate_proj": ColwiseParallel(),
-                    "up_proj": ColwiseParallel(),
-                    "down_proj": RowwiseParallel(),
-                },
-                src_data_rank=None,
-            )
+            for name in ("gate_proj", "up_proj"):
+                setattr(
+                    layer.mlp, name, ColumnLinear(getattr(layer.mlp, name), device_mesh)
+                )
+            layer.mlp.down_proj = RowLinear(layer.mlp.down_proj, device_mesh)
         elif isinstance(layer.mlp, MyInklingMoE):
             layer.mlp.shared_experts = _TPSharedExperts(
                 layer.mlp.shared_experts, device_mesh
             )
 
-    parallelize_module(
-        model,
-        device_mesh,
-        {"lm_head": ColwiseParallel(output_layouts=Replicate())},
-        src_data_rank=None,
-    )
-    text_config = config.text_config
-    text_config.num_attention_heads //= tp_size
-    text_config.num_key_value_heads //= tp_size
-    text_config.swa_num_attention_heads //= tp_size
-    text_config.swa_num_key_value_heads //= tp_size
+    model.lm_head = ColumnLinear(model.lm_head, device_mesh, sync_after_forward=True)
+
+    for name in (
+        "num_attention_heads",
+        "num_key_value_heads",
+        "swa_num_attention_heads",
+        "swa_num_key_value_heads",
+    ):
+        setattr(config.text_config, name, getattr(config.text_config, name) // tp_size)
     return model
