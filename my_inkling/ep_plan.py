@@ -49,7 +49,7 @@ class OffloadedExperts(nn.Module):
             scale=scale,
             double_scale=scale2,
             block_sizes={-1: 16},
-            fast=False,
+            fast=False, # fast=True not supported on RTX 3090
         )
 
     def forward(
