@@ -76,3 +76,12 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 - `_HeadParallelConv1d` because `local_channels` is `total_channels // world_size`
 
 ## 7. Grouping expert GEMMs and reusing buffers
+
+- Combines all expert GEMMs into a single batched GEMM
+  - just a regular GEMM with the experts as a launch dimension
+  - dequantization now happens in the kernel as well
+  - a pointer table is used so the expert weights don't have to be contiguous
+- `_route` just runs the parallel stream compaction algorithm to quickly select which tokens to use for each expert
+- The reused buffers are `self.host_metadata`, `self.metadata`, 
+(the views into them), and then `self.counts`
+  - also the ones created in `reserve()`
