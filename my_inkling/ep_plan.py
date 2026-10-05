@@ -91,12 +91,14 @@ class OffloadedExperts(nn.Module):
             _, slot = self.lru_slots.popitem(last=False)  # LRU eviction
         self.lru_slots[expert_id] = slot  # assigning new expert to slot
 
-        # Initiate copy of 6 weights on copy stream
+        # Initiate copy of 6 weights (2 if unquantized) on copy stream
         copied = {}
         with torch.cuda.stream(self.copy_stream):
             for projection in ("gate_up_proj", "down_proj"):
                 for suffix in ("", "_scale", "_scale2"):
                     name = projection + suffix
+                    if name not in self.weights:
+                        continue
                     getattr(self, "cache_" + name)[slot].copy_(
                         self.weights[name][expert_id], non_blocking=True
                     )
@@ -128,8 +130,13 @@ class OffloadedExperts(nn.Module):
         Returns the weight matrix for the given projection and expert ID,
         converted to the same device and dtype as `like`.
         """
+        # Some layers are stored unquantized and have no scale banks
+        quantized = projection + "_scale" in self.weights
+
         if expert_id in self.gpu_expert_ids:
             weight = self.weights[projection][expert_id]
+            if not quantized:
+                return weight.to(like.dtype)
             scale, scale2 = (
                 self.weights[projection + suffix][expert_id]
                 for suffix in ["_scale", "_scale2"]
@@ -151,6 +158,8 @@ class OffloadedExperts(nn.Module):
                     del self.pending[slot]
 
             weight = getattr(self, "cache_" + projection)[slot]
+            if not quantized:
+                return weight.to(like.dtype)
             scale, scale2 = (
                 getattr(self, "cache_" + projection + suffix)[slot]
                 for suffix in ("_scale", "_scale2")
@@ -186,7 +195,7 @@ class OffloadedExperts(nn.Module):
                 self.matrix("gate_up_proj", expert_id, hidden_states),
             )
 
-            # Packed checkpoints retain interleaved gate/up rows.
+            # Expert banks retain the checkpoint's interleaved gate/up rows.
             gate, up = projected[:, 0::2], projected[:, 1::2]
 
             current_hidden_states = F.linear(

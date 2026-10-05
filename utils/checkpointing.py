@@ -152,6 +152,8 @@ def load_expert_state_dict(
     Returns ``{weight_name: {global_expert_id: tensor}}``. Mixed-device banks
     cannot be loaded directly with ``model.load_state_dict``. NVFP4 weights
     remain packed, with their ``_scale`` and ``_scale2`` tensors preserved.
+    Layers stored unquantized have no scale banks. Either way, gate/up rows
+    stay interleaved as in the checkpoint.
     """
     rank = device_mesh.get_local_rank()
     device = torch.device("cuda", torch.cuda.current_device())
@@ -164,7 +166,7 @@ def load_expert_state_dict(
         shard_size = -(-num_experts // device_mesh.size())
         start = min(rank * shard_size, num_experts)
         converted = convert_checkpoint_tensors(
-            {key: tensor_slice[start : start + shard_size]}, packed_experts=packed
+            {key: tensor_slice[start : start + shard_size]}, packed_experts=True
         )
         for name, bank in converted.items():
             if not packed:
