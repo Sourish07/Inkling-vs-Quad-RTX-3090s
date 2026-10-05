@@ -146,4 +146,5 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 - KV cache allocations are all preallocated
   - Need to add paging later
 - `position` is a GPU scaler that counts number of tokens seen so far
+- Also put the `TextStreamer` on a background thread
 - Running at 17.22 tok/s
