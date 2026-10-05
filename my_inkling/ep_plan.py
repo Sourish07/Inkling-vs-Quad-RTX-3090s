@@ -36,6 +36,10 @@ class OffloadedExperts(nn.Module):
         self.packed = "gate_up_proj_scale" in weights
 
     def matrix(self, projection: str, expert_id: int, like: T) -> T:
+        """
+        Returns the weight matrix for the given projection and expert ID, converted to the
+        same device and dtype as `like`.
+        """
         weight = self.weights[projection][expert_id].to(like.device)
         if not self.packed:
             return weight
