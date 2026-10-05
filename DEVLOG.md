@@ -138,3 +138,12 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
     - Uses a mirrored ring buffer; cost is double storage
     - Replaced `torch.roll`, which would create new allocation each time
 - Running at ~14.77 tok/s!
+
+## 11. Static buffers and complete decode CUDA graphs
+
+- Cudagraphs requires static buffers; Graph replay uses the exact same memory addresses
+- Added graph warmup
+- KV cache allocations are all preallocated
+  - Need to add paging later
+- `position` is a GPU scaler that counts number of tokens seen so far
+- Running at 17.22 tok/s
