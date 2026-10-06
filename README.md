@@ -2,19 +2,19 @@
 
 Optimizing [Inkling Small](https://huggingface.co/thinkingmachines/Inkling-Small-NVFP4) (total NVFP4 weights ~159 GiB) to run on 96 GiB of VRAM (across 4 RTX 3090s) & 128 GiB of host RAM.
 
-The challenge: Non-expert weights are 15.38 GiB (9.7%) but the expert weights are 143.62 GiB (90.3%). This means the experts don't fit completely in host memory or sharded across GPUs. **We pin select experts in VRAM and store the rest in host memory, then built a custom engine to stream experts from host memory on demand.** CPU-resident experts remain cached in VRAM and are evicted via LRU policy.
+The challenge: Non-expert weights are 15.38 GiB (9.7%) but the expert weights are 143.62 GiB (90.3%). This means the experts don't fit completely in host memory or sharded across GPUs. **I keep a subset of experts in VRAM, store the rest in pinned host memory, and stream experts to GPUs on demand.** CPU-resident experts are cached in VRAM and are evicted via LRU policy to avoid repeated transfers.
+
+Result: ~0.10 tok/s → 18.14 tok/s (~181× improvement) on 4× RTX 3090s.
 
 ### Benchmarking
 
 List of optimizations (so far!):
 
-*the "s/tok" units are not a typo lol*
-
 | Optimization | Speed |
 |---|---:|
-| Baseline — `accelerate` CPU offloading | 10 s/tok |
-| KV + short-convolution caching | 8.6 s/tok |
-| Tensor parallelism for non-expert weights | 7.45 s/tok |
+| Baseline — `accelerate` CPU offloading | 0.10 tok/s |
+| KV + short-convolution caching | 0.12 tok/s |
+| Tensor parallelism for non-expert weights | 0.13 tok/s |
 | Expert parallelism + CPU offloading | 2.6 tok/s |
 | CPU expert caching | 3.28 tok/s |
 | Remove DTensor interface | 4.39 tok/s |
@@ -26,7 +26,7 @@ List of optimizations (so far!):
 | Paired NVLink/PCIe tensor-parallel reductions | **18.14 tok/s** |
 
 Notes:
-- All calculations are done with conc=1 for now.
+- All calculations are done with conc=1 for now. Warmup & prefill are excluded.
 - MFU calculations (back of napkin math):
   - Peak BF16 flops for RTX 3090 (assuming stock boost clock speed): 71 TFLOP/s
   - Number of active parameters in forward pass: 12B
@@ -41,6 +41,8 @@ Notes:
 Please read [DEVLOG.md](DEVLOG.md) for more details about my journey.
 
 ### Hardware
+
+GPU topology: 2 NVLink-connected RTX 3090 pairs; cross-pair traffic traverses PCIe.
 
 - AORUS GeForce RTX 3090 XTREME 24G x4
 - PNY NVIDIA NVLink Bridge x2
@@ -58,7 +60,7 @@ For the NVFP4 checkpoint, all routed experts except layer 2 are quantized to NVF
 ### Future features to come!
 
 - Add vision & audio towers
-- Benchmark with TP
+- Shard experts with TP instead of EP (and benchmark)
 - Batched decode
 - Custom GPU-pinned expert selection
 - Vary num pinned experts by layers

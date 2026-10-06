@@ -151,5 +151,7 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 
 ## 12. Paired NVLink/PCIe tensor-parallel reductions
 
+- Ported from SGLang
+- Need to use symmetric memory for potential speed ups
 - Running at 18.14 tok/s
 
