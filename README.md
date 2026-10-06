@@ -1,9 +1,11 @@
 # Running Inkling-Small-NVFP4 on Local Hardware!
 
-Optimizing [Inkling Small](https://huggingface.co/thinkingmachines/Inkling-Small-NVFP4) (total NVFP4 weights ~171 GB) to run on 96 GB of VRAM (across 4 RTX 3090s) & 128 GB of host RAM.
+Optimizing [Inkling Small](https://huggingface.co/thinkingmachines/Inkling-Small-NVFP4) (total NVFP4 weights ~159 GiB) to run on 96 GiB of VRAM (across 4 RTX 3090s) & 128 GiB of host RAM.
 
-List of optimizations:
-- 1. Baseline, naive implementation (because model doesn't fit entirely in GPUs or in host memory)
+The challenge: Non-expert weights are 15.38 GiB (9.7%) but the expert weights are 143.62 GiB (90.3%). This means the experts don't fit completely in host memory or sharded across GPUs. *We split experts across GPUs and host memory, and built a custom engine to stream experts from host memory as necessary based on routing results.*
+
+List of optimizations (so far!):
+- 1. Baseline, naive implementation (just with `accelerate`'s cpu offloading)
   - Speed: 10 s/tok
 - 2. Caching for KV vectors & short convolutions
   - Speed: 8.6 s/tok
