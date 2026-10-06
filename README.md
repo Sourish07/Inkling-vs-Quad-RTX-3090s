@@ -30,15 +30,22 @@ Please read [DEVLOG.md](DEVLOG.md) for more details about my journey.
 
 ### Hardware
 
-- RTX 3090s x4
-- 128 GiB host RAM
+- AORUS GeForce RTX 3090 XTREME 24G x4
+- PNY NVIDIA NVLink Bridge x2
+- AMD Ryzen Threadripper Pro 5955WX
+- Pro WS WRX80E-SAGE SE WIFI
+- VENGEANCE LPX 128GB (8 x 16GB) DDR4 DRAM 2666MHz C16 Memory Kit
+- Lexar® PLAY 2280 SE PCIe 4.0 SSD
 
-### Architecture
+### Model Architecture
 
-Inkling-Small is a MoE model with <> layers and <> experts.
+Inkling-Small is a MoE model with 42 layers (first two are dense) and 256 experts. Each token is routed to 6 experts and 2 shared experts. Attention is hybrid, between full attention (every 6th layer) and sliding window attention (window of 512 tokens). The model contains "short convolutions" for additional interaction with nearby tokens. Instead of RoPE, we use a learned relative position bias instead.
 
+For the NVFP4 checkpoint, all routed experts except layer 2 are quantized to NVFP4.
 
 ### Future features to come!
+
+- Add vision & audio towers
 - Benchmark with TP
 - Batched decode
 - Custom GPU-pinned expert selection
