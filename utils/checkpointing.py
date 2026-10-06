@@ -12,6 +12,7 @@ from transformers import AutoConfig
 from transformers.conversion_mapping import get_checkpoint_conversion_mapping
 from transformers.core_model_loading import WeightConverter, WeightRenaming
 
+from kernels.nvfp4_marlin import marlin_utils
 from utils.flashpack_cache import (
     cache_directory,
     cache_ready,
@@ -164,6 +165,50 @@ def load_non_expert_state_dict(
     return state
 
 
+@torch.no_grad()
+def pack_experts_for_marlin(
+    state: dict[str, dict[int, torch.Tensor]],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> None:
+    """Repack NVFP4 expert banks from the checkpoint layout to the Marlin layout.
+
+    Each tensor is rewritten inside its own allocation, which the Marlin layout
+    fills exactly, so GPU and pinned-CPU placement are unchanged:
+
+        weight  uint8 [N, K/2]  ->  int32 [K/16, 2N]
+        scale   fp8 [N, K/16]   ->  fp8 [K/16, N]  (Marlin's byte encoding)
+        scale2  float32 []      ->  ``dtype`` [2]  (exponent bias folded in, then padding)
+
+    Banks of layers stored unquantized have no scales and are left alone.
+    """
+    for name in [name for name in state if name.endswith("_scale")]:
+        weights, scales, scale2s = (
+            state[name.removesuffix("_scale") + suffix]
+            for suffix in ("", "_scale", "_scale2")
+        )
+        for expert in weights:
+            packed = weights[expert].to(device)
+            size_n, half_k = packed.shape
+            codes = torch.stack((packed & 15, packed >> 4), dim=-1).flatten(1)
+            target = weights[expert].view(-1).view(torch.int32)
+            target = target.view(half_k // 8, 2 * size_n)
+            target.copy_(marlin_utils.marlin_pack_weight(codes))
+            weights[expert] = target
+
+            scale = scales[expert].to(device).view(torch.float8_e4m3fn)
+            target = scales[expert].view(half_k // 8, size_n)
+            target.view(torch.uint8).copy_(
+                marlin_utils.marlin_pack_scale(scale).view(torch.uint8)
+            )
+            scales[expert] = target
+
+            scale2 = marlin_utils.marlin_pack_scale2(scale2s[expert].to(device), dtype)
+            target = scale2s[expert].view(1).view(dtype)
+            target.copy_(torch.cat((scale2, torch.zeros_like(scale2))))
+            scale2s[expert] = target
+
+
 def load_expert_state_dict(
     model: torch.nn.Module,
     checkpoint_dir: str | Path,
@@ -178,12 +223,14 @@ def load_expert_state_dict(
 
     Returns ``{weight_name: {global_expert_id: tensor}}``. Mixed-device banks
     cannot be loaded directly with ``model.load_state_dict``. NVFP4 weights
-    remain packed, with their ``_scale`` and ``_scale2`` tensors preserved.
-    Layers stored unquantized have no scale banks. Either way, gate/up rows
-    stay interleaved as in the checkpoint.
+    remain packed, with their ``_scale`` and ``_scale2`` tensors, and are
+    returned in the Marlin layout (``pack_experts_for_marlin``). Layers stored
+    unquantized have no scale banks. Either way, gate/up rows stay interleaved
+    as in the checkpoint.
 
     Complete FlashPack caches bypass conversion and sharding. Cache misses use
     the original flow above, then save GPU packs and a shared CPU-expert pack.
+    The cache holds the checkpoint layout; Marlin packing runs on every load.
     """
     rank = device_mesh.get_local_rank()
     device = torch.device("cuda", torch.cuda.current_device())
@@ -194,9 +241,12 @@ def load_expert_state_dict(
         experts=True,
         gpu_experts=gpu_experts_per_rank,
     )
-    if cache_ready(cache, device_mesh, device, experts=True):
-        return load_experts(cache, device_mesh, device)
     templates = model.state_dict()
+    dtype = next(v.dtype for k, v in templates.items() if ".mlp.experts." in k)
+    if cache_ready(cache, device_mesh, device, experts=True):
+        state = load_experts(cache, device_mesh, device)
+        pack_experts_for_marlin(state, dtype, device)
+        return state
     state = {}
     for handle, key in _llm_tensors(checkpoint_dir, "cpu", experts=True):
         tensor_slice = handle.get_slice(key)
@@ -219,4 +269,5 @@ def load_expert_state_dict(
         del converted
     if cache is not None:
         save_experts(state, cache, device_mesh)
+    pack_experts_for_marlin(state, dtype, device)
     return state

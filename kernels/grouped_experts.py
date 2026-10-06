@@ -1,10 +1,16 @@
 """
-Grouped expert projections over checkpoint-layout BF16 or NVFP4 weights.
+Grouped expert projections over BF16 or Marlin-packed NVFP4 weights.
 """
 
 import torch
 import triton
 import triton.language as tl
+
+from .nvfp4_marlin import nvfp4_linear
+from .nvfp4_marlin.cute_nvfp4_decode import prepare_grouped
+
+# The larger tiles of the Marlin batch kernel need more shared memory than sm86 has.
+MARLIN_MAX_ROWS = 16
 
 
 @triton.jit
@@ -20,7 +26,6 @@ def _gemm(
     K: tl.constexpr,
     TOP_K: tl.constexpr,
     PROJECTION: tl.constexpr,
-    QUANTIZED: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
@@ -28,9 +33,9 @@ def _gemm(
     """
     Compute one projection for one tile of one active expert's routed rows.
 
-    Each program finds its weights through the pointer table and dequantizes
-    NVFP4 inline. This lets one launch cover all active experts, wherever their
-    weights are, with no launch per expert and no dequantized copy of the weights.
+    Each program finds its BF16 weights through the pointer table. This lets one
+    launch cover all active experts, wherever their weights are, with no launch
+    per expert. NVFP4 layers use the Marlin kernels instead.
     """
     group = tl.program_id(1)
     tile = tl.program_id(0)
@@ -38,15 +43,8 @@ def _gemm(
     count = tl.load(Counts + group)
     if tile // tl.cdiv(N, BN) * BM < count:
         expert = tl.load(Experts + group)
-        pointer_stride = 6 if QUANTIZED else 2
-        projection_stride = 3 if QUANTIZED else 1
-        pointers = Pointers + expert * pointer_stride + PROJECTION * projection_stride
         dtype = X.dtype.element_ty
-        weight_dtype = tl.uint8 if QUANTIZED else dtype
-        weight = tl.load(pointers).to(tl.pointer_type(weight_dtype))
-        if QUANTIZED:
-            scale = tl.load(pointers + 1).to(tl.pointer_type(tl.uint8))
-            scale2 = tl.load(tl.load(pointers + 2).to(tl.pointer_type(tl.float32)))
+        weight = tl.load(Pointers + expert * 2 + PROJECTION).to(tl.pointer_type(dtype))
         route = tl.load(Rows + group * CAPACITY + row, row < count, 0)
         input_row = route // TOP_K if PROJECTION == 0 else route
         cols = tile % tl.cdiv(N, BN) * BN + tl.arange(0, BN)
@@ -59,47 +57,11 @@ def _gemm(
                 (row[:, None] < count) & (k[None, :] < K),
                 0,
             )
-            if QUANTIZED:
-                packed = tl.load(
-                    weight + cols[None, :] * (K // 2) + k[:, None] // 2,
-                    (cols[None, :] < N) & (k[:, None] < K),
-                    0,
-                )
-                code = (packed >> ((k[:, None] % 2) * 4)) & 15
-                magnitude = code & 7
-                value = tl.where(
-                    magnitude == 0,
-                    0.0,
-                    tl.where(
-                        magnitude == 1,
-                        0.5,
-                        (2 + magnitude % 2)
-                        * tl.exp2((magnitude // 2).to(tl.float32) - 2),
-                    ),
-                )
-                value = tl.where((code & 8) != 0, -value, value)
-                bits = tl.load(
-                    scale + cols[None, :] * (K // 16) + k[:, None] // 16,
-                    (cols[None, :] < N) & (k[:, None] < K),
-                    0,
-                )
-                # Decode E4M3 in FP32: Ampere has no native FP8 conversion.
-                # NVFP4 scales are E4M3
-                exponent = (bits >> 3) & 15
-                mantissa = bits & 7
-                block_scale = tl.where(
-                    exponent == 0,
-                    mantissa * (2.0**-9),
-                    (1 + mantissa * 0.125) * tl.exp2(exponent.to(tl.float32) - 7),
-                )
-                block_scale = tl.where((bits & 128) != 0, -block_scale, block_scale)
-                b = (value * (block_scale * scale2)).to(dtype)
-            else:
-                b = tl.load(
-                    weight + cols[None, :] * K + k[:, None],
-                    (cols[None, :] < N) & (k[:, None] < K),
-                    0,
-                )
+            b = tl.load(
+                weight + cols[None, :] * K + k[:, None],
+                (cols[None, :] < N) & (k[:, None] < K),
+                0,
+            )
             acc += tl.dot(a, b)
         tl.store(
             Y + route[:, None] * N + cols[None, :],
@@ -181,8 +143,13 @@ class GroupedExperts:
         )
         self.experts = torch.empty(len(expert_ids), dtype=torch.int32, device=device)
         self.counts = torch.empty(len(expert_ids), dtype=torch.int32, device=device)
+        # One 64-byte record per group for the grouped Marlin kernel (see _plan).
+        self.records = torch.zeros(
+            (len(expert_ids), 8), dtype=torch.int64, device=device
+        )
         self.capacity = 0
         self.group_size = 0  # Set by ExpertCache.prepare before each forward.
+        self.lookup = None  # Set by ExpertCache: expert -> weight tensors.
 
     def reserve(self, routes):
         """
@@ -215,6 +182,69 @@ class GroupedExperts:
         routes = indices.numel()
         self.reserve(routes)
         top_k = indices.shape[1]
+        if not self.quantized:
+            self._project_bf16(x, routes, top_k)
+        elif x.shape[0] == 1:
+            self._project_marlin_token(x, routes)
+        else:
+            self._project_marlin_rows(x, top_k)
+        _reduce[(x.shape[0], triton.cdiv(self.hidden_dim, 256))](
+            self.down,
+            indices,
+            weights,
+            self.pointers,
+            output,
+            self.hidden_dim,
+            top_k,
+            self.pointer_stride,
+            self.max_expert,
+            256,
+        )
+
+    def _activate(self, projected, out=None):
+        return torch.mul(self.act_fn(projected[:, 0::2]), projected[:, 1::2], out=out)
+
+    def _project_marlin_token(self, x, routes):
+        """
+        One token: every active expert has one row, so each projection is one launch.
+
+        The kernel finds each group's weights and rows in the planner's records.
+        Its arguments are fixed, which keeps the launch valid in the decode graph.
+        """
+        if x.data_ptr() % 16 or not x.is_contiguous():
+            x = x.contiguous().clone()
+        groups = self.group_size
+        # Record words 6 and 7 hold the group's route and that route's token.
+        prepare_grouped(x, self.records, 7, 6, self.gate_up, groups, projection=0)()
+        self._activate(self.gate_up[:routes], out=self.activated[:routes])
+        prepare_grouped(
+            self.activated, self.records, 6, 6, self.down, groups, projection=1
+        )()
+
+    def _project_marlin_rows(self, x, top_k):
+        """
+        Many tokens (prefill): one host-dispatched Marlin call per active expert.
+
+        Reading the routing back synchronizes with the GPU, which only prefill
+        can afford. Rows are chunked to the largest tile that fits sm86.
+        """
+        tensors = self.lookup()
+        experts = self.experts[: self.group_size].tolist()
+        counts = self.counts[: self.group_size].tolist()
+        for group, (expert, count) in enumerate(zip(experts, counts)):
+            if count == 0:
+                continue
+            weight, scale, scale2, down_weight, down_scale, down_scale2 = tensors(
+                expert
+            )
+            routes = self.rows[group, :count].long()
+            for chunk in routes.split(MARLIN_MAX_ROWS):
+                projected = nvfp4_linear(x[chunk // top_k], weight, scale, scale2[:1])
+                self.down[chunk] = nvfp4_linear(
+                    self._activate(projected), down_weight, down_scale, down_scale2[:1]
+                )
+
+    def _project_bf16(self, x, routes, top_k):
         for projection, inputs, target, n, k in (
             (0, x, self.gate_up, 2 * self.intermediate_dim, self.hidden_dim),
             (1, self.activated, self.down, self.hidden_dim, self.intermediate_dim),
@@ -232,28 +262,10 @@ class GroupedExperts:
                 k,
                 top_k,
                 projection,
-                self.quantized,
                 16,
                 64,
                 64,
             )
             # TODO: I can probably fuse
             if projection == 0:
-                projected = self.gate_up[:routes]
-                torch.mul(
-                    self.act_fn(projected[:, 0::2]),
-                    projected[:, 1::2],
-                    out=self.activated[:routes],
-                )
-        _reduce[(x.shape[0], triton.cdiv(self.hidden_dim, 256))](
-            self.down,
-            indices,
-            weights,
-            self.pointers,
-            output,
-            self.hidden_dim,
-            top_k,
-            self.pointer_stride,
-            self.max_expert,
-            256,
-        )
+                self._activate(self.gate_up[:routes], out=self.activated[:routes])

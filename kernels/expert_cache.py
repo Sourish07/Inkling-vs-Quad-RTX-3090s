@@ -21,6 +21,7 @@ def _plan(
     Experts,
     Counts,
     Rows,
+    Records,
     START: tl.constexpr,
     LOCAL: tl.constexpr,
     SLOTS: tl.constexpr,
@@ -30,9 +31,14 @@ def _plan(
     E: tl.constexpr,
     S: tl.constexpr,
     R: tl.constexpr,
+    TOP_K: tl.constexpr,
+    RECORDS: tl.constexpr,
 ):
     """
     Groups token routing by expert, assign LRU slots to cache misses, write to the pointer table.
+
+    With RECORDS, each group also gets a 64-byte record for the grouped Marlin kernel:
+    its expert's pointers, then its first route and that route's token.
 
     Runs as one program so all decisions see the same cache state. Planning on
     the GPU means the host never downloads (from GPU) expert IDs (a forced sync) and never
@@ -91,11 +97,19 @@ def _plan(
     group = tl.cumsum(active.to(tl.int32)) - 1
     tl.store(Experts + e, -1, e < LOCAL)
     tl.store(Counts + e, 0, e < LOCAL)
+    if RECORDS:
+        # A zero weight pointer marks an unused group.
+        for projection in tl.static_range(2):
+            tl.store(Records + e * 8 + projection * 3, 0, e < LOCAL)
     tl.debug_barrier()
     tl.store(Experts + group, START + e, active)
     tl.store(Counts + group, counts, active)
     positions = tl.cumsum(matches.to(tl.int32), 1) - 1
     tl.store(Rows + group[:, None] * CAPACITY + positions, r[None, :], matches)
+    if RECORDS:
+        first = tl.sum(tl.where(matches & (positions == 0), r[None, :], 0), 1)
+        tl.store(Records + group * 8 + 6, first.to(tl.int64), active)
+        tl.store(Records + group * 8 + 7, (first // TOP_K).to(tl.int64), active)
 
     # Step 4: loop that updates the pointer table
     for bank in tl.static_range(STRIDE):
@@ -111,6 +125,8 @@ def _plan(
             tl.where(active, pointer, 0),
             e < LOCAL,
         )
+        if RECORDS:
+            tl.store(Records + group * 8 + bank, pointer, active)
 
 
 @triton.jit
@@ -183,6 +199,14 @@ class ExpertCache:
             for name in names
             for w in weights[name].values()
         )
+        # The Marlin kernels fetch weights and scales in 16-byte units.
+        assert not grouped.quantized or all(
+            w.data_ptr() % 16 == 0
+            for name in names
+            if not name.endswith("_scale2")
+            for w in weights[name].values()
+        )
+        self.names = names
         self.sources = torch.tensor(
             [[weights[name][e].data_ptr() for name in names] for e in ids],
             dtype=torch.int64,
@@ -211,6 +235,25 @@ class ExpertCache:
         self.clock = torch.zeros((), dtype=torch.int32, device=device)
         self.copy_experts = torch.empty(num_slots, dtype=torch.int32, device=device)
         self.grouped = grouped
+        grouped.lookup = self.lookup
+
+    def lookup(self):
+        """
+        Return expert -> its weight tensors as the last `prepare` placed them.
+
+        Downloads the slot assignment, so only host-dispatched forwards (prefill)
+        call it. Experts that got no slot are copied to the GPU for that call.
+        """
+        slots = {e: s for s, e in enumerate(self.slot_experts.tolist()) if e >= 0}
+        device = self.grouped.device
+
+        def tensors(expert):
+            slot = slots.get(expert - self.start)
+            if self.weights[self.names[0]][expert].is_cuda or slot is None:
+                return [self.weights[name][expert].to(device) for name in self.names]
+            return [bank[slot] for bank in self.banks]
+
+        return tensors
 
     def prepare(self, indices):
         """
@@ -235,6 +278,7 @@ class ExpertCache:
             self.grouped.experts,
             self.grouped.counts,
             self.grouped.rows,
+            self.grouped.records,
             self.start,
             self.local,
             self.num_slots,
@@ -244,6 +288,8 @@ class ExpertCache:
             triton.next_power_of_2(self.local),
             triton.next_power_of_2(self.num_slots),
             triton.next_power_of_2(routes),
+            indices.shape[1],
+            self.grouped.quantized,
             num_warps=4,
         )
         _copy[(128, self.num_slots)](
