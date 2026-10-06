@@ -19,8 +19,8 @@ class OffloadedExperts(nn.Module):
     Drop-in replacement for `MyInklingExperts` with a GPU-managed LRU expert cache in VRAM
     - Keep resident GPU experts and cache CPU experts in `num_slots` slots.
     - Expects weights already sharded with EP with replicated inputs.
-    - Assumes mixed CPU/GPU storage and enough cache slots for one token's CPU experts.
-    - Overflow prefill experts read mapped pinned host weights directly.
+    - Assumes mixed CPU/GPU storage; cache slots are shared across the batch.
+    - Overflow experts read mapped pinned host weights directly, including in decode.
     - NVFP4 checkpoint: layer 2 is BF16; all other expert layers are quantized.
 
     Example weights dict format:
@@ -71,17 +71,30 @@ class OffloadedExperts(nn.Module):
 
         self.cache = ExpertCache(weights, self.weight_names, num_slots, self.grouped)
 
+    def prepare_decode_workspace(self, batch_size):
+        """Release prefill scratch before allocating graph state and its snapshot."""
+        self.grouped.reserve(batch_size * self.choices_per_token, shrink=True)
+
     def forward(
         self,
         hidden_states: Fp[T, "t d"],
         top_k_index: Int[T, "t k"],
         top_k_weights: Fp[T, "t k"],
     ) -> Fp[T, "t d"]:
+        self.choices_per_token = top_k_index.shape[1]
         final_hidden_states = torch.zeros_like(hidden_states, dtype=torch.float32)
-        self.cache.prepare(top_k_index)
-        self.grouped.forward(
-            hidden_states, top_k_index, top_k_weights, final_hidden_states
-        )
+        # Bound persistent per-layer scratch and the planner's expert-by-route
+        # scan during batched prefill. Decode (at most 16 tokens) uses one chunk.
+        for start in range(0, hidden_states.shape[0], 64):
+            end = start + 64
+            indices = top_k_index[start:end]
+            self.cache.prepare(indices)
+            self.grouped.forward(
+                hidden_states[start:end],
+                indices,
+                top_k_weights[start:end],
+                final_hidden_states[start:end],
+            )
         final_hidden_states = all_reduce(
             final_hidden_states, self.device_mesh.get_group()
         )

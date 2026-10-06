@@ -184,16 +184,17 @@ class GroupedExperts:
         self.capacity = 0
         self.group_size = 0  # Set by ExpertCache.prepare before each forward.
 
-    def reserve(self, routes):
+    def reserve(self, routes, *, shrink=False):
         """
         Grow the routing rows and projection scratch to hold `routes` routes.
 
-        Prefill has many more routes than decode. Growing to a power of two and
-        never shrinking lets later forwards reuse the same buffers.
+        Forwards grow to a power of two and reuse their buffers. At the transition
+        to captured decode, shrink=True releases excess prefill scratch once.
         """
-        if routes <= self.capacity:
+        capacity = triton.next_power_of_2(routes)
+        if capacity == self.capacity or (routes <= self.capacity and not shrink):
             return
-        self.capacity = triton.next_power_of_2(routes)
+        self.capacity = capacity
         self.rows = torch.empty(
             (len(self.experts), self.capacity), dtype=torch.int32, device=self.device
         )

@@ -1,5 +1,7 @@
 """
-Cache shape names (batch size is currently fixed to 1).
+Cache shape names for a fixed batch of 1–16 requests.
+
+bs               = batch size
 
 d                = feature/channel width
 hk               = key/value heads
@@ -52,15 +54,15 @@ class ShortConvLayerCache:
             dim = config.hidden_size
 
         self.dim = dim
-        self.cache: Fp[T, "1 d conv_kernel_size"] | None = None
+        self.cache: Fp[T, "bs d conv_kernel_size"] | None = None
 
-    def update_cache(self, tokens: Fp[T, "1 d s"]) -> Fp[T, "1 d conv_kernel_size"]:
+    def update_cache(self, tokens: Fp[T, "bs d s"]) -> Fp[T, "bs d conv_kernel_size"]:
         """
         Only ran during prefill
         """
         if self.cache is None:
             self.cache = tokens.new_zeros(
-                (1, self.dim, self.conv_kernel_size), dtype=torch.float32
+                (tokens.shape[0], self.dim, self.conv_kernel_size), dtype=torch.float32
             )
 
         roll_size = min(tokens.shape[2], self.conv_kernel_size)
@@ -87,16 +89,18 @@ class FullAttentionLayerCache:
         self.kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
 
-        self.k_cache: Fp[T, "1 hk capacity c"] | None = None
-        self.v_cache: Fp[T, "1 hk capacity c"] | None = None
+        self.k_cache: Fp[T, "bs hk capacity c"] | None = None
+        self.v_cache: Fp[T, "bs hk capacity c"] | None = None
         self.curr_size = 0
         self.tokens_seen = 0
         self.key_positions: T | None = None
 
     def allocate(
-        self, reference: Fp[T, "1 hk reference_length c"], size: int = 256
-    ) -> Fp[T, "1 hk size c"]:
-        return reference.new_zeros((1, self.kv_heads, size, self.head_dim))
+        self, reference: Fp[T, "bs hk reference_length c"], size: int = 256
+    ) -> Fp[T, "bs hk size c"]:
+        return reference.new_zeros(
+            (reference.shape[0], self.kv_heads, size, self.head_dim)
+        )
 
     def extend_cache(self) -> None:
         assert self.k_cache is not None and self.v_cache is not None
@@ -105,9 +109,9 @@ class FullAttentionLayerCache:
 
     def update_cache(
         self,
-        key_states: Fp[T, "1 hk s c"],
-        value_states: Fp[T, "1 hk s c"],
-    ) -> tuple[Fp[T, "1 hk k_len c"], Fp[T, "1 hk k_len c"]]:
+        key_states: Fp[T, "bs hk s c"],
+        value_states: Fp[T, "bs hk s c"],
+    ) -> tuple[Fp[T, "bs hk k_len c"], Fp[T, "bs hk k_len c"]]:
         if self.k_cache is None:
             self.k_cache = self.allocate(key_states)
             self.v_cache = self.allocate(value_states)
@@ -141,57 +145,78 @@ class SlidingWindowAttentionLayerCache:
         ]
 
         self.sliding_window_size = config.sliding_window_size
+        self.storage_window = 0
 
-        self.k_cache: Fp[T, "1 hk capacity c"] | None = None
-        self.v_cache: Fp[T, "1 hk capacity c"] | None = None
+        self.k_cache: Fp[T, "bs hk capacity c"] | None = None
+        self.v_cache: Fp[T, "bs hk capacity c"] | None = None
         self.curr_size = 0
         self.tokens_seen = 0
         self.key_positions: T | None = None
 
     def update_cache(
         self,
-        key_states: Fp[T, "1 hk s c"],
-        value_states: Fp[T, "1 hk s c"],
-    ) -> tuple[Fp[T, "1 hk k_len c"], Fp[T, "1 hk k_len c"]]:
+        key_states: Fp[T, "bs hk s c"],
+        value_states: Fp[T, "bs hk s c"],
+    ) -> tuple[Fp[T, "bs hk k_len c"], Fp[T, "bs hk k_len c"]]:
         roll_size = key_states.shape[2]
-        # TODO: fix cases where prefill prompt > sliding window size
-        assert roll_size <= self.sliding_window_size
 
-        if self.k_cache is None:
+        needed = min(self.curr_size + roll_size, self.sliding_window_size)
+        if needed > self.storage_window:
+            # A short prefill does not need two complete 512-token rings per row.
+            # Grow before rollover, while all existing keys still occupy a prefix.
+            self.storage_window = min(
+                self.sliding_window_size, 1 << (needed - 1).bit_length()
+            )
             shape = (
-                1,
+                key_states.shape[0],
                 key_states.shape[1],
-                2 * self.sliding_window_size,
+                2 * self.storage_window,
                 key_states.shape[3],
             )
-            self.k_cache = key_states.new_zeros(shape)
-            self.v_cache = value_states.new_zeros(shape)
+            key, value = key_states.new_zeros(shape), value_states.new_zeros(shape)
+            if self.k_cache is not None:
+                for target, source in ((key, self.k_cache), (value, self.v_cache)):
+                    target[:, :, : self.curr_size].copy_(source[:, :, : self.curr_size])
+                    target[
+                        :, :, self.storage_window : self.storage_window + self.curr_size
+                    ].copy_(source[:, :, : self.curr_size])
+            self.k_cache, self.v_cache = key, value
 
-        self.curr_size = min(self.curr_size + roll_size, self.sliding_window_size)
+        self.curr_size = needed
 
+        # Only the newest window is retained; writing older tokens as well would
+        # race on wrapped destinations when a prefill exceeds the window.
+        retained = min(roll_size, self.sliding_window_size)
         # Mirror each position so rollover never needs to move existing tokens.
         update_kv(
-            key_states,
-            value_states,
+            key_states[:, :, -retained:],
+            value_states[:, :, -retained:],
             self.k_cache,
             self.v_cache,
-            self.tokens_seen % self.sliding_window_size,
-            self.sliding_window_size,
+            (self.tokens_seen + roll_size - retained) % self.storage_window,
+            self.storage_window,
         )
 
         self.tokens_seen += roll_size
 
-        end = (
-            self.sliding_window_size
-            + (self.tokens_seen - 1) % self.sliding_window_size
-            + 1
-        )
+        if roll_size > self.sliding_window_size:
+            # Prefill attention needs all incoming keys for the early queries.
+            return key_states, value_states
+
+        end = self.storage_window + (self.tokens_seen - 1) % self.storage_window + 1
         start = end - self.curr_size
         return self.k_cache[:, :, start:end], self.v_cache[:, :, start:end]
 
 
 class MyInklingCache:
-    def __init__(self, config: "InklingTextConfig"):
+    def __init__(self, config: "InklingTextConfig", left_padding: T | None = None):
+        """Cache for one synchronous batch; left_padding counts leading pad tokens.
+
+        Rows keep their slots until the batch ends. All rows advance together,
+        including finished requests whose later outputs the caller discards.
+        """
+        self.left_padding = left_padding
+        self.batch_size = None
         layer_classes = {
             "hybrid": FullAttentionLayerCache,
             "hybrid_sliding": SlidingWindowAttentionLayerCache,
@@ -201,8 +226,20 @@ class MyInklingCache:
         ]
         self.position = None
 
+    def validate_batch(self, batch_size: int) -> None:
+        if not 1 <= batch_size <= 16:
+            raise ValueError("batch size must be between 1 and 16")
+        if self.batch_size is None:
+            if self.left_padding is not None and self.left_padding.shape != (
+                batch_size,
+            ):
+                raise ValueError("left_padding must have one value per request")
+            self.batch_size = batch_size
+        elif batch_size != self.batch_size:
+            raise ValueError("a populated cache cannot change batch size")
+
     def prepare_decode(self, capacity: int) -> None:
-        """Freeze a populated batch-one cache for at most `capacity` total tokens.
+        """Freeze a populated fixed-batch cache for at most `capacity` total tokens.
 
         Sliding keys retain their physical ring order; attention masks use GPU
         distances instead of moving keys or changing tensor shapes each token.
@@ -216,15 +253,24 @@ class MyInklingCache:
             assert all(conv.initialized for conv in layer.conv_caches)
             assert layer.k_cache is not None and layer.v_cache is not None
             if isinstance(layer, FullAttentionLayerCache):
-                shape = (1, layer.kv_heads, capacity, layer.head_dim)
+                shape = (
+                    layer.k_cache.shape[0],
+                    layer.kv_heads,
+                    capacity,
+                    layer.head_dim,
+                )
                 key = layer.k_cache.new_zeros(shape)
                 value = layer.v_cache.new_zeros(shape)
                 key[:, :, :seen].copy_(layer.k_cache[:, :, :seen])
                 value[:, :, :seen].copy_(layer.v_cache[:, :, :seen])
             else:
                 window = layer.sliding_window_size
-                key = layer.k_cache[:, :, :window].clone()
-                value = layer.v_cache[:, :, :window].clone()
+                shape = (*layer.k_cache.shape[:2], window, layer.k_cache.shape[-1])
+                key = layer.k_cache.new_zeros(shape)
+                value = layer.v_cache.new_zeros(shape)
+                retained = min(seen, window)
+                key[:, :, :retained].copy_(layer.k_cache[:, :, :retained])
+                value[:, :, :retained].copy_(layer.v_cache[:, :, :retained])
             layer.k_cache, layer.v_cache = key, value
             layer.key_positions = torch.arange(key.shape[2], device=key.device)
         self.position = torch.tensor(seen, dtype=torch.int64, device=key.device)
@@ -251,12 +297,13 @@ class MyInklingCache:
 
     def update_attn_cache(
         self,
-        key_states: Fp[T, "1 hk s c"],
-        value_states: Fp[T, "1 hk s c"],
+        key_states: Fp[T, "bs hk s c"],
+        value_states: Fp[T, "bs hk s c"],
         layer_idx: int,
-    ) -> tuple[Fp[T, "1 hk k_len c"], Fp[T, "1 hk k_len c"]]:
+    ) -> tuple[Fp[T, "bs hk k_len c"], Fp[T, "bs hk k_len c"]]:
+        self.validate_batch(key_states.shape[0])
         if self.position is not None:
-            assert key_states.shape[0] == key_states.shape[2] == 1
+            assert key_states.shape[2] == 1
             layer = self.layers[layer_idx]
             window = getattr(layer, "sliding_window_size", 0)
             update_kv(
@@ -273,10 +320,10 @@ class MyInklingCache:
 
     def update_conv_cache(
         self,
-        hidden_states: Fp[T, "1 d s"],
+        hidden_states: Fp[T, "bs d s"],
         layer_idx: int,
         conv_idx: int,
-    ) -> Fp[T, "1 d conv_kernel_size"]:
+    ) -> Fp[T, "bs d conv_kernel_size"]:
         return self.layers[layer_idx].conv_caches[conv_idx].update_cache(hidden_states)
 
     def has_previous_state(self, layer_idx: int, conv_idx: int) -> bool:

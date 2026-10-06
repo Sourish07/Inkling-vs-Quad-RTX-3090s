@@ -7,7 +7,6 @@ from jaxtyping import Int
 from torch import Tensor as T
 from torch import nn
 from torch.nn import functional as F
-from transformers import InklingForConditionalGeneration
 
 from kernels.decode import rms_norm, short_conv
 
@@ -408,7 +407,7 @@ class MyInklingShortConv(nn.Module):
             self.layer_idx, self.conv_idx
         ):
             # Decode: the kernel shifts the cached history in place.
-            assert hidden_states.shape[:2] == (1, 1)
+            assert hidden_states.shape[1] == 1
             history = cache.layers[self.layer_idx].conv_caches[self.conv_idx].cache
             return short_conv(hidden_states, self.conv1d.weight, history, residual)
         input_dtype = hidden_states.dtype
@@ -558,14 +557,28 @@ class MyInklingAttention(nn.Module):
                 allowed &= distance < self.sliding_window
             sdpa_mask = position_bias.masked_fill(~allowed, float("-inf"))
 
+        if cache is not None and cache.left_padding is not None:
+            # Keys use aligned, padded positions; each request has its own start.
+            query_position = (
+                cache.position
+                if static_decode
+                else torch.arange(q_len, device=hidden_states.device) + query_start
+            )
+            key_position = query_position.reshape(-1, 1) - distance
+            valid = key_position[None, None] >= cache.left_padding[:, None, None, None]
+            sdpa_mask = sdpa_mask.masked_fill(~valid, float("-inf"))
+
         # Inkling scales both content scores and relative bias in full attention.
         if (
             static_decode
             and not self.is_sliding
             and self.log_scaling_n_floor is not None
         ):
+            effective_n = cache.position.float() + 1
+            if cache.left_padding is not None:
+                effective_n = effective_n - cache.left_padding[:, None, None, None]
             tau = 1.0 + self.log_scaling_alpha * torch.log(
-                ((cache.position.float() + 1) / self.log_scaling_n_floor).clamp(min=1.0)
+                (effective_n / self.log_scaling_n_floor).clamp(min=1.0)
             )
             query_states = (query_states.float() * tau).to(query_states.dtype)
             sdpa_mask = (sdpa_mask.float() * tau).to(sdpa_mask.dtype)
@@ -577,10 +590,12 @@ class MyInklingAttention(nn.Module):
             effective_n = (
                 torch.arange(q_len, device=hidden_states.device) + query_start + 1
             ).float()
+            effective_n = effective_n.view(1, 1, q_len, 1)
+            if cache is not None and cache.left_padding is not None:
+                effective_n = effective_n - cache.left_padding[:, None, None, None]
             tau = 1.0 + self.log_scaling_alpha * torch.log(
                 (effective_n / self.log_scaling_n_floor).clamp(min=1.0)
             )
-            tau = tau.view(1, 1, q_len, 1)
             query_states = (query_states.float() * tau).to(query_states.dtype)
             sdpa_mask = (sdpa_mask.float() * tau).to(sdpa_mask.dtype)
 
@@ -676,8 +691,22 @@ class MyInklingTextTower(nn.Module):
     def forward(
         self, input_ids: Int[T, "bs s"], cache: MyInklingCache | None = None
     ) -> Fp[T, "bs s d"]:
-        """Process unpadded tokens with an optional request-scoped cache."""
+        """Process tokens with an optional fixed-batch, left-padding-aware cache."""
+        if cache is not None:
+            cache.validate_batch(input_ids.shape[0])
         hidden_states = self.embed_tokens(input_ids)
+        if (
+            cache is not None
+            and cache.left_padding is not None
+            and cache.position is None
+        ):
+            positions = torch.arange(input_ids.shape[1], device=input_ids.device)
+            valid = (
+                positions[None, :] + cache.layers[0].tokens_seen
+                >= cache.left_padding[:, None]
+            )
+            # Padded tokens must also contribute zero to convolution histories.
+            hidden_states = hidden_states.masked_fill(~valid[..., None], 0)
         for layer in self.layers:
             hidden_states = layer(hidden_states, cache=cache)
         return self.norm(hidden_states)

@@ -86,7 +86,7 @@ def _plan(
     tl.store(Clock, tick)
 
     # Step 3: Compact active experts into a bounded GPU group list
-    # Decode launches at most top_k groups; prefill can launch all local experts without host reads.
+    # A batch can activate up to batch_size * top_k groups, bounded by LOCAL.
     # used to be _route previous, logic is ported here (stream compaction)
     group = tl.cumsum(active.to(tl.int32)) - 1
     tl.store(Experts + e, -1, e < LOCAL)
@@ -103,8 +103,8 @@ def _plan(
         destination = tl.load(
             Destinations + slot * STRIDE + bank, (e < LOCAL) & (slot >= 0), 0
         )
-        # Overflow prefill experts read mapped host weights directly. Decode
-        # fits in the cache, so all its GEMMs read GPU storage.
+        # Active experts beyond the slot budget read mapped host weights directly,
+        # including during batched decode; active cache hits are never evicted.
         pointer = tl.where(~resident & (slot >= 0), destination, source)
         tl.store(
             Pointers + (START + e) * STRIDE + bank,

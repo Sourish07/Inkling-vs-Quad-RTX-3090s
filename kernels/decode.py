@@ -1,5 +1,5 @@
 """
-Small inference kernels; convolution history is FP32 and decode is batch one.
+Small inference kernels; convolution histories are FP32 and independent per row.
 """
 
 import torch
@@ -64,6 +64,8 @@ def _short_conv(
     History,
     Residual,
     Y,
+    X_BATCH_STRIDE: tl.constexpr,
+    RESIDUAL_BATCH_STRIDE: tl.constexpr,
     D: tl.constexpr,
     K: tl.constexpr,
     ADD_RESIDUAL: tl.constexpr,
@@ -77,6 +79,11 @@ def _short_conv(
     same launch.
     """
     d = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    batch = tl.program_id(1)
+    X += batch * X_BATCH_STRIDE
+    History += batch * D * K
+    Residual += batch * RESIDUAL_BATCH_STRIDE
+    Y += batch * D
     current = tl.load(X + d, d < D, 0).to(tl.float32)
     total = tl.full((BLOCK,), 0, tl.float32)
     # A channel belongs to one lane: load each old value before overwriting it.
@@ -96,14 +103,18 @@ def _short_conv(
 
 
 def short_conv(x, weight, history, residual=None):
-    output = torch.empty_like(x)
+    assert x.ndim == 3 and x.shape[1] == 1
+    assert history.shape == (x.shape[0], x.shape[-1], weight.shape[-1])
+    output = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     width = x.shape[-1]
-    _short_conv[(triton.cdiv(width, 256),)](
+    _short_conv[(triton.cdiv(width, 256), x.shape[0])](
         x,
         weight,
         history,
         residual if residual is not None else x,
         output,
+        x.stride(0),
+        residual.stride(0) if residual is not None else x.stride(0),
         width,
         weight.shape[-1],
         residual is not None,
@@ -119,6 +130,7 @@ def _update_kv(
     V,
     KCache,
     VCache,
+    BATCH: tl.constexpr,
     HEADS: tl.constexpr,
     S: tl.constexpr,
     D: tl.constexpr,
@@ -141,37 +153,48 @@ def _update_kv(
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     channel = i % D
     token = i // D % S
-    head = i // (D * S)
+    head = i // (D * S) % HEADS
+    batch = i // (D * S * HEADS)
     key = tl.load(
-        K + head * K_STRIDES[1] + token * K_STRIDES[2] + channel * K_STRIDES[3],
-        i < HEADS * S * D,
+        K
+        + batch * K_STRIDES[0]
+        + head * K_STRIDES[1]
+        + token * K_STRIDES[2]
+        + channel * K_STRIDES[3],
+        i < BATCH * HEADS * S * D,
         0,
     )
     value = tl.load(
-        V + head * V_STRIDES[1] + token * V_STRIDES[2] + channel * V_STRIDES[3],
-        i < HEADS * S * D,
+        V
+        + batch * V_STRIDES[0]
+        + head * V_STRIDES[1]
+        + token * V_STRIDES[2]
+        + channel * V_STRIDES[3],
+        i < BATCH * HEADS * S * D,
         0,
     )
     start = tl.load(START) if DEVICE_START else START
     position = start + token
     if WINDOW:
         position %= WINDOW
-    destination = (head * CAPACITY + position) * D + channel
-    tl.store(KCache + destination, key, i < HEADS * S * D)
-    tl.store(VCache + destination, value, i < HEADS * S * D)
+    destination = ((batch * HEADS + head) * CAPACITY + position) * D + channel
+    tl.store(KCache + destination, key, i < BATCH * HEADS * S * D)
+    tl.store(VCache + destination, value, i < BATCH * HEADS * S * D)
     if WINDOW and MIRROR:
         # Mirrored ring: the newest window is always a contiguous chronological view.
-        tl.store(KCache + destination + WINDOW * D, key, i < HEADS * S * D)
-        tl.store(VCache + destination + WINDOW * D, value, i < HEADS * S * D)
+        tl.store(KCache + destination + WINDOW * D, key, i < BATCH * HEADS * S * D)
+        tl.store(VCache + destination + WINDOW * D, value, i < BATCH * HEADS * S * D)
 
 
 def update_kv(key, value, k_cache, v_cache, start, window=0, mirror=True):
-    assert key.shape[0] == 1
+    assert key.shape == value.shape
+    assert key.shape[:2] == k_cache.shape[:2] == v_cache.shape[:2]
     _update_kv[(triton.cdiv(key.numel(), 256),)](
         key,
         value,
         k_cache,
         v_cache,
+        key.shape[0],
         key.shape[1],
         key.shape[2],
         key.shape[3],
