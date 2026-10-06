@@ -20,6 +20,7 @@ from transformers.models.inkling.configuration_inkling import (
 from my_inkling import MyInkling
 from my_inkling import model as inkling
 from my_inkling.cache import MyInklingCache
+from my_inkling.decode_graph import DecodeGraph
 
 
 @pytest.fixture(autouse=True)
@@ -294,13 +295,16 @@ def test_attention_fp32(layer_idx: int, text_config: InklingTextConfig) -> None:
 @torch.no_grad()
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="K/V cache requires CUDA")
 @pytest.mark.parametrize("layer_idx", [0, 1], ids=["full", "sliding"])
-def test_attention_cached_fp32(layer_idx: int, text_config: InklingTextConfig) -> None:
+@pytest.mark.parametrize("bs", range(1, 17))
+def test_attention_cached_fp32(
+    layer_idx: int, bs: int, text_config: InklingTextConfig
+) -> None:
     """Decode through SWA rollover and past the learned relative-bias extent."""
     actual, reference = pair(
         inkling.MyInklingAttention(text_config, layer_idx),
         hf.InklingAttention(text_config, layer_idx),
     )
-    states = torch.randn(1, 10, text_config.hidden_size)
+    states = torch.randn(bs, 10, text_config.hidden_size)
     positions = torch.arange(states.shape[1])
     distance = positions[:, None] - positions[None, :]
     allowed = distance >= 0
@@ -316,6 +320,11 @@ def test_attention_cached_fp32(layer_idx: int, text_config: InklingTextConfig) -
         end = start + size
         output = actual(states[:, start:end].cuda(), cache).cpu()
         assert_fp32_close(output, expected[:, start:end])
+        if layer_idx == 1 and start == 0:
+            assert (
+                cache.layers[layer_idx].k_cache.shape[2]
+                < 2 * text_config.sliding_window_size
+            )
         start = end
 
 
@@ -362,6 +371,87 @@ def test_text_tower_fp32(seq_len: int, text_config: InklingTextConfig) -> None:
     expected = reference(input_ids=ids, use_cache=False).last_hidden_state
     output = actual(ids)
     assert_fp32_close(output, expected)
+
+
+@torch.inference_mode()
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="decode graph requires CUDA")
+@pytest.mark.parametrize("bs", range(1, 17))
+def test_batched_decode_graph_matches_independent_requests(
+    bs: int, config: InklingConfig
+) -> None:
+    """Different prompt lengths, long prefill, ring rollover and graph state restoration."""
+    config.text_config.mlp_layer_types = ["dense", "dense"]
+    actual, reference = pair(
+        MyInkling(config),
+        hf.InklingForConditionalGeneration(config),
+        ignored_prefixes=("model.audio_tower.", "model.vision_tower."),
+    )
+    actual = actual.cuda()
+    prompts = [torch.randint(1, 28, (1, 1 + row % 7)) for row in range(bs)]
+    width = max(prompt.shape[1] for prompt in prompts)
+    padded = torch.zeros(bs, width, dtype=torch.int64, device="cuda")
+    padding = torch.tensor(
+        [width - prompt.shape[1] for prompt in prompts], device="cuda"
+    )
+    for row, prompt in enumerate(prompts):
+        padded[row, -prompt.shape[1] :] = prompt.cuda()
+    cache = MyInklingCache(config.text_config, left_padding=padding)
+
+    def expected_logits():
+        return torch.cat(
+            [
+                reference(input_ids=prompt, use_cache=False).logits[:, -1:]
+                for prompt in prompts
+            ]
+        )
+
+    logits = actual(padded, cache=cache)
+    torch.testing.assert_close(logits.cpu(), expected_logits(), rtol=1e-4, atol=1e-5)
+    next_token = logits[:, -1].argmax(dim=-1, keepdim=True)
+    graph = DecodeGraph(actual, cache, next_token, capacity=width + 6)
+    try:
+        assert cache.position.item() == width
+        torch.testing.assert_close(graph.token, next_token)
+        saved_buffers = [buffer.clone() for buffer in cache.decode_buffers()]
+        # Capture/warmup must leave the request at its prefilled state.
+        eager_cache = MyInklingCache(config.text_config, left_padding=padding)
+        actual(padded, cache=eager_cache)
+        eager_cache.prepare_decode(width + 6)
+        for restored, expected in zip(saved_buffers, eager_cache.decode_buffers()):
+            torch.testing.assert_close(restored, expected, rtol=0, atol=0)
+        for _ in range(6):
+            for row in range(bs):
+                prompts[row] = torch.cat(
+                    [prompts[row], next_token[row : row + 1].cpu()], dim=1
+                )
+            next_token = graph.replay()
+            expected = expected_logits()
+            torch.testing.assert_close(
+                graph.logits.cpu(), expected, rtol=1e-4, atol=1e-5
+            )
+            torch.testing.assert_close(
+                next_token.cpu(), expected[:, -1].argmax(dim=-1, keepdim=True)
+            )
+        with pytest.raises(AssertionError, match="capacity exhausted"):
+            graph.replay()
+    finally:
+        torch.cuda.synchronize()
+        graph.graph.reset()
+
+
+@pytest.mark.parametrize("bs", [0, 17])
+def test_cache_rejects_unsupported_batch_sizes(
+    bs: int, text_config: InklingTextConfig
+) -> None:
+    with pytest.raises(ValueError, match="between 1 and 16"):
+        MyInklingCache(text_config).validate_batch(bs)
+
+
+def test_cache_rejects_changed_batch_size(text_config: InklingTextConfig) -> None:
+    cache = MyInklingCache(text_config)
+    cache.validate_batch(2)
+    with pytest.raises(ValueError, match="cannot change batch size"):
+        cache.validate_batch(3)
 
 
 @torch.no_grad()
