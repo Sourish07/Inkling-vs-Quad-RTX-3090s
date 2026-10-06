@@ -25,5 +25,7 @@ List of optimizations:
   - Speed: 14.77 tok/s
 - 11. Cudagraph replay for decode
   - Speed: 17.22 tok/s
+- 12: Paired NVLink/PCIe tensor-parallel reductions
+  - Speed: 18.14 tok/s
  
 Please read [DEVLOG.md](DEVLOG.md) for more details about my journey.
