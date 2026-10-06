@@ -2,7 +2,9 @@
 
 Optimizing [Inkling Small](https://huggingface.co/thinkingmachines/Inkling-Small-NVFP4) (total NVFP4 weights ~159 GiB) to run on 96 GiB of VRAM (across 4 RTX 3090s) & 128 GiB of host RAM.
 
-The challenge: Non-expert weights are 15.38 GiB (9.7%) but the expert weights are 143.62 GiB (90.3%). This means the experts don't fit completely in host memory or sharded across GPUs. **We split experts across GPUs and host memory, and built a custom engine to stream experts from host memory as necessary based on routing results.**
+The challenge: Non-expert weights are 15.38 GiB (9.7%) but the expert weights are 143.62 GiB (90.3%). This means the experts don't fit completely in host memory or sharded across GPUs. **We pin select experts in VRAM and store the rest in host memory, then built a custom engine to stream experts from host memory on demand.** CPU-resident experts remain cached in VRAM and are evicted via LRU policy.
+
+### Benchmarking
 
 List of optimizations (so far!):
 
@@ -23,6 +25,16 @@ List of optimizations (so far!):
 | CUDA Graph replay for decode | 17.22 tok/s |
 | Paired NVLink/PCIe tensor-parallel reductions | **18.14 tok/s** |
 
+Notes:
+- All calculations are done with conc=1 for now.
+- MFU calculations (back of napkin math):
+  - Peak BF16 flops for RTX 3090 (assuming stock boost clock speed): 71 TFLOP/s
+  - Number of active parameters in forward pass: 12B
+  - Number of FLOPs in decode forward pass: 2 * 12B = 24 GFLOPs = 0.024 TFLOPs
+  - 18.14 tok/s = ~55 ms per token
+  - 0.024 TFLOPs / 0.055 seconds = 0.436 TFLOP/s
+  - MFU = 0.436 TFLOP/s / (4 * 71 TFLOP/s) = 0.00153 -> **0.153% MFU**
+  - Not taking into account cost of dequantizing FP4 weights & applying scales
 
 ### Interesting things I learned
 
