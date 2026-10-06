@@ -39,7 +39,8 @@ Future features to come!
 - Use separate stream for shared experts
 - Paged KV cache
 - Sequence packing + custom `flash_attn_varlen_func` & `flash_attn_with_kvcache` kernels (because additive bias isn't supported)
-- Continuous batching + prefill/decode scheduling 
-- Clean diagram of Inkling model
+- Continuous batching + prefill/decode scheduling + HTTP interface
+- Visual diagram of Inkling model
 - Non-greedy sampling
 - More efficient checkpoint loading
+- More robust benchmarking
