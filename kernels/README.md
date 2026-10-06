@@ -34,7 +34,7 @@ Scratch is private to each call, so different CUDA streams can launch safely.
 ## Checkpoint preparation
 
 `prepare_nvfp4(weight, scale, scale2, dtype=torch.bfloat16)` accepts the same
-three ModelOpt tensors currently dequantized by `OffloadedExperts.matrix`:
+three tensors in the ModelOpt NVFP4 checkpoint format:
 
 | Tensor | Checkpoint input | Prepared output |
 | --- | --- | --- |
@@ -48,11 +48,9 @@ N must be a positive multiple of 128, and K a positive multiple of 64. There
 is no padding or automatic dequantization fallback. Both FP16 and BF16
 activations are supported; prepare separately if changing activation dtype.
 
-`ep_plan.py` still uses its existing dequantization path. Integration requires
-preparing its weight banks before cache allocation and replacing its
-`F.linear(..., self.matrix(...))` calls with this operation, using the same
-per-projection event waits. Prepared tensors must not be passed to the old
-`matrix()` method, which expects checkpoint layout.
+`OffloadedExperts` in `ep_plan.py` does not use this kernel: it runs the
+grouped Triton path (`ExpertCache` and `GroupedExperts`), which reads NVFP4
+banks in checkpoint layout. Prepared tensors must not be passed to that path.
 
 ## Build and validation
 
