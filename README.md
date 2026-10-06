@@ -29,3 +29,17 @@ List of optimizations:
   - Speed: 18.14 tok/s
  
 Please read [DEVLOG.md](DEVLOG.md) for more details about my journey.
+
+Future features to come!
+- Benchmark with TP
+- Batched decode
+- Custom GPU-pinned expert selection
+- Vary num pinned experts by layers
+- Port over marlin kernel from sglang
+- Use separate stream for shared experts
+- Paged KV cache
+- Sequence packing + custom `flash_attn_varlen_func` & `flash_attn_with_kvcache` kernels (because additive bias isn't supported)
+- Continuous batching + prefill/decode scheduling 
+- Clean diagram of Inkling model
+- Non-greedy sampling
+- More efficient checkpoint loading
