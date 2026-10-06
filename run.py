@@ -33,6 +33,7 @@ def main(
     profile: bool = False,
     log2_max_new_tokens: int = 7,
     gpu_experts_per_rank: int = 24,
+    cuda_graph: bool = True,
 ) -> None:
     """Generate from the sharded Inkling model and report decode throughput.
 
@@ -41,6 +42,8 @@ def main(
         log2_max_new_tokens: Generate at most 2**log2_max_new_tokens tokens.
         gpu_experts_per_rank: First N experts in each rank's shard stay on GPU; the
             rest use pinned CPU RAM.
+        cuda_graph: Replay decode steps from a captured CUDA graph; disable to run
+            them eagerly.
     """
     device, local_rank = setup_ddp_local()
     world_size = get_world_size()
@@ -132,12 +135,17 @@ def main(
             is_eos = host_token.item() == tokenizer.eos_token_id
             if step == 0:
                 if not is_eos and max_new_tokens > 1:
-                    logger.info("Warming up and capturing complete decode CUDA graph")
+                    logger.info(
+                        "Warming up and capturing complete decode CUDA graph"
+                        if cuda_graph
+                        else "Warming up eager decode (CUDA graph disabled)"
+                    )
                     decode_graph = DecodeGraph(
                         model,
                         cache,
                         next_input,
                         capacity=num_tokens + max_new_tokens - 1,
+                        capture=cuda_graph,
                     )
                     decode_start = time.perf_counter()
             else:
@@ -160,7 +168,7 @@ def main(
         )
 
     # NCCL communicator shutdown waits for every captured graph to be released.
-    if decode_graph is not None:
+    if decode_graph is not None and decode_graph.graph is not None:
         torch.cuda.synchronize()
         decode_graph.graph.reset()
     torch.distributed.destroy_process_group()
