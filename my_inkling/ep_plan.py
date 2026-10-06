@@ -1,6 +1,9 @@
+from time import perf_counter
+
 import torch
 from jaxtyping import Float as Fp
 from jaxtyping import Int
+from loguru import logger
 from torch import Tensor as T
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
@@ -94,24 +97,38 @@ def apply_ep_plan(
     expert_state_dict: dict[str, dict[int, torch.Tensor]],
     num_slots: int,
 ) -> MyInkling:
-    for name, module in list(model.named_modules()):
-        if isinstance(module, MyInklingExperts):
-            # Isolate just the 6 weight banks (proj, scale, scale2) * (gate_up, down) for this layer
-            # the "per-expert" dictionaries (ex. {0: packed_tensor, 1: packed_tensor}) are
-            # prebuilt from checkpoint loader
-            weights = {
-                key.removeprefix(f"{name}."): bank
-                for key, bank in expert_state_dict.items()
-                if key.startswith(f"{name}.")
-            }
-            model.set_submodule(
-                name,
-                OffloadedExperts(
-                    module,
-                    device_mesh,
-                    weights,
-                    num_slots,
-                    layer_idx=int(name.split(".")[-3]),
-                ),
-            )
+    modules = [
+        (name, module)
+        for name, module in model.named_modules()
+        if isinstance(module, MyInklingExperts)
+    ]
+    started = perf_counter()
+    logger.info("Preparing {} expert layers for EP", len(modules))
+    for index, (name, module) in enumerate(modules, start=1):
+        logger.info("Preparing expert layer {}/{}: {}", index, len(modules), name)
+        # Isolate just the 6 weight banks (proj, scale, scale2) * (gate_up, down) for this layer
+        # the "per-expert" dictionaries (ex. {0: packed_tensor, 1: packed_tensor}) are
+        # prebuilt from checkpoint loader
+        weights = {
+            key.removeprefix(f"{name}."): bank
+            for key, bank in expert_state_dict.items()
+            if key.startswith(f"{name}.")
+        }
+        model.set_submodule(
+            name,
+            OffloadedExperts(
+                module,
+                device_mesh,
+                weights,
+                num_slots,
+                layer_idx=int(name.split(".")[-3]),
+            ),
+        )
+        logger.info(
+            "Prepared expert layer {}/{}; elapsed {:.1f}s",
+            index,
+            len(modules),
+            perf_counter() - started,
+        )
+    logger.info("EP expert preparation complete in {:.1f}s", perf_counter() - started)
     return model

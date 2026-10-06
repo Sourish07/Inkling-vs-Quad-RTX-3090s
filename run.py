@@ -70,11 +70,14 @@ def main(
     del non_expert_state_dict
     model.fuse_attention_projections()
 
+    logger.info("Loading routed expert banks from checkpoint")
     expert_state_dict = load_expert_state_dict(
         model, local_hf_path, device_mesh, gpu_experts_per_rank
     )
+    logger.info("Checkpoint weights loaded; preparing expert layers")
     apply_ep_plan(model, device_mesh, expert_state_dict, num_slots=10)
 
+    logger.info("Expert preparation finished; waiting for other ranks")
     torch.distributed.barrier()
     logger.info(f"Inkling model loaded on device {device}")
 
