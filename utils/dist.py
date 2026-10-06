@@ -25,6 +25,9 @@ def seed_everything(seed: int = 42):
 
 
 def setup_ddp_local():
+    os.environ.setdefault("NCCL_P2P_LEVEL", "SYS")
+    os.environ.setdefault("NCCL_P2P_READ_ENABLE", "1")
+    os.environ.setdefault("NCCL_ALGO", "allreduce:tree")
     os.environ["TORCH_NCCL_SHOW_EAGER_INIT_P2P_SERIALIZATION_WARNING"] = "false"
     if os.environ.get("WORLD_SIZE") is None:
         os.environ["RANK"] = "0"

@@ -23,5 +23,7 @@ List of optimizations:
   - Speed: 11.22 tok/s
 - 10. Fusing normalization, short convolutions, and cache updates
   - Speed: 14.77 tok/s
+- 11. Cudagraph replay for decode
+  - Speed: 17.22 tok/s
  
 Please read [DEVLOG.md](DEVLOG.md) for more details about my journey.

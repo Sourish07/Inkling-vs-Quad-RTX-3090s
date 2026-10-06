@@ -6,6 +6,7 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
 from kernels import ExpertCache, GroupedExperts
+from kernels.paired_all_reduce import all_reduce
 
 from .model import (
     MyInkling,
@@ -81,8 +82,8 @@ class OffloadedExperts(nn.Module):
         self.grouped.forward(
             hidden_states, top_k_index, top_k_weights, final_hidden_states
         )
-        torch.distributed.all_reduce(
-            final_hidden_states, group=self.device_mesh.get_group()
+        final_hidden_states = all_reduce(
+            final_hidden_states, self.device_mesh.get_group()
         )
         return final_hidden_states.to(hidden_states.dtype)
 

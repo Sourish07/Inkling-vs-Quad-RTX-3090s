@@ -148,3 +148,8 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 - `position` is a GPU scaler that counts number of tokens seen so far
 - Also put the `TextStreamer` on a background thread
 - Running at 17.22 tok/s
+
+## 12. Paired NVLink/PCIe tensor-parallel reductions
+
+- Running at 18.14 tok/s
+

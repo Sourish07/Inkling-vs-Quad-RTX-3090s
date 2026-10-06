@@ -11,6 +11,8 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.nn import functional as F
 
+from kernels.paired_all_reduce import all_reduce
+
 from .model import (
     InklingConfig,
     MyInkling,
@@ -62,8 +64,7 @@ class RowLinear(nn.Linear):
 
     def forward(self, x: T) -> T:
         output = super().forward(x)
-        dist.all_reduce(output, group=self.device_mesh.get_group())
-        return output
+        return all_reduce(output, self.device_mesh.get_group())
 
 
 class ColumnLinear(nn.Linear):
@@ -119,7 +120,7 @@ class _VocabParallelEmbedding(MyInklingNormedEmbedding):
         embeddings = F.embedding(local_ids.masked_fill(outside, 0), self.weight)
         embeddings.masked_fill_(outside.unsqueeze(-1), 0)
 
-        dist.all_reduce(embeddings, group=self.device_mesh.get_group())
+        embeddings = all_reduce(embeddings, self.device_mesh.get_group())
 
         return self.embed_norm(embeddings)
 
@@ -142,8 +143,7 @@ class _TPSharedExperts(MyInklingSharedExperts):
         self, hidden_states: Fp[T, "bs s d"], gammas: Fp[T, "bs*s e_s"]
     ) -> Fp[T, "bs s d"]:
         output = super().forward(hidden_states, gammas)
-        dist.all_reduce(output, group=self.device_mesh.get_group())
-        return output
+        return all_reduce(output, self.device_mesh.get_group())
 
 
 class _HeadParallelConv1d(nn.Conv1d):
