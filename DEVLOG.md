@@ -152,6 +152,7 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 ## 12. Paired NVLink/PCIe tensor-parallel reductions
 
 - Ported from SGLang
-- Need to use symmetric memory for potential speed ups
+- GPUs 0 & 1 are connected via NVLink, same with GPUs 2 & 3
+- The PCIe hop depends on driver-level p2p (which I have a patched driver for installed)
+- Need to use PyTorch's symmetric memory for potential speed ups
 - Running at 18.14 tok/s
-
