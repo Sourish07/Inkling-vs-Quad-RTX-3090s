@@ -1,5 +1,4 @@
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import tyro
@@ -34,6 +33,7 @@ def main(
     log2_max_new_tokens: int = 7,
     gpu_experts_per_rank: int = 24,
     cuda_graph: bool = True,
+    batch_size: int = 1,
 ) -> None:
     """Generate from the sharded Inkling model and report decode throughput.
 
@@ -81,18 +81,26 @@ def main(
     torch.distributed.barrier()
     logger.info(f"Inkling model loaded on device {device}")
 
-    prompt_text = "What are the computational benefits of Mixture-of-Experts models?"
-    prompt = [{"role": "user", "content": prompt_text}]
+    with open("prompts.txt", "r") as f:
+        prompt_text = f.readlines()[:batch_size]
+    prompt = [[{"role": "user", "content": txt.strip()}] for txt in prompt_text]
 
     logger.info("Running tokenizer...")
+    tokenizer.padding_side = "left"
+    tokenizer.pad_token = tokenizer.convert_ids_to_tokens(config.eos_token_id)
+
     inputs: BatchEncoding = tokenizer.apply_chat_template(
         prompt,
         add_generation_prompt=True,
         return_tensors="pt",
         return_dict=True,
         reasoning_effort="none",
+        padding=True,
     )
+    seq_lens = inputs["attention_mask"].sum(dim=1)
+    print("seq_lens", seq_lens)
     inputs = inputs.to(device)
+    print("inputs", inputs)
     num_tokens = inputs["input_ids"].shape[1]
     logger.info(f"running generation with {num_tokens} input tokens")
 
@@ -101,14 +109,12 @@ def main(
     streamer = (
         TextStreamer(tokenizer, skip_special_tokens=True) if local_rank == 0 else None
     )
-    output_pool = ThreadPoolExecutor(max_workers=1) if streamer is not None else None
-    output_future = None
     next_input = inputs["input_ids"]
 
     # Step 0 is prefill (+ first token); the decode clock starts after it.
     decode_start = 0.0
     num_decode_tokens = 0
-    cache = MyInklingCache(config.text_config)
+    cache = MyInklingCache(config.text_config, batch_size=batch_size)
     decode_graph = None
 
     profiler = Profiler(enable=profile)
@@ -126,13 +132,12 @@ def main(
                 else:
                     assert decode_graph is not None
                     next_input = decode_graph.replay()
+
             host_token = next_input.cpu()
             if streamer is not None:
-                assert output_pool is not None
-                if output_future is not None:
-                    output_future.result()
-                output_future = output_pool.submit(streamer.put, host_token)
-            is_eos = host_token.item() == tokenizer.eos_token_id
+                streamer.put(host_token)
+            is_eos = all(host_token.item() == tokenizer.eos_token_id for _ in range(host_token.shape[0]))
+
             if step == 0:
                 if not is_eos and max_new_tokens > 1:
                     logger.info(
@@ -150,13 +155,11 @@ def main(
                     decode_start = time.perf_counter()
             else:
                 num_decode_tokens += 1
+
             if is_eos:
                 break
 
     if streamer is not None:
-        assert output_pool is not None and output_future is not None
-        output_future.result()
-        output_pool.shutdown()
         streamer.end()
     decode_time = time.perf_counter() - decode_start
     profiler.stop()

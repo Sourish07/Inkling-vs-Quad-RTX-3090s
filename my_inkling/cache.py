@@ -35,11 +35,13 @@ class ShortConvLayerCache:
         config: "InklingTextConfig",
         is_kv_sconv: bool = True,
         is_swa: bool = True,
+        batch_size: int = 16,
     ):
         self.initialized = False
 
         self.is_kv_sconv = is_kv_sconv
         self.is_swa = is_swa
+        self.batch_size = batch_size
 
         self.conv_kernel_size = config.conv_kernel_size
 
@@ -52,19 +54,21 @@ class ShortConvLayerCache:
             dim = config.hidden_size
 
         self.dim = dim
-        self.cache: Fp[T, "1 d conv_kernel_size"] | None = None
+        self.cache: Fp[T, "bs d conv_kernel_size"] | None = None
 
-    def update_cache(self, tokens: Fp[T, "1 d s"]) -> Fp[T, "1 d conv_kernel_size"]:
+    def update_cache(self, tokens: Fp[T, "bs d s"]) -> Fp[T, "bs d conv_kernel_size"]:
         """
         Only ran during prefill
         """
         if self.cache is None:
             self.cache = tokens.new_zeros(
-                (1, self.dim, self.conv_kernel_size), dtype=torch.float32
+                (self.batch_size, self.dim, self.conv_kernel_size), dtype=torch.float32
             )
 
         roll_size = min(tokens.shape[2], self.conv_kernel_size)
         self.cache = torch.roll(self.cache, -roll_size, dims=-1)
+        print("self.cache", self.cache.shape)
+        print("tokens", tokens.shape)
         self.cache[..., -roll_size:].copy_(tokens[:, :, -roll_size:])
 
         self.initialized = True
@@ -77,26 +81,28 @@ class FullAttentionLayerCache:
     Contains cache for full attention
     """
 
-    def __init__(self, config: "InklingTextConfig"):
+    def __init__(self, config: "InklingTextConfig", batch_size: int = 16):
         self.conv_caches = [
-            ShortConvLayerCache(config, is_kv_sconv=True, is_swa=False),
-            ShortConvLayerCache(config, is_kv_sconv=True, is_swa=False),
-            ShortConvLayerCache(config, is_kv_sconv=False),
-            ShortConvLayerCache(config, is_kv_sconv=False),
+            ShortConvLayerCache(config, is_kv_sconv=True, is_swa=False, batch_size=batch_size),
+            ShortConvLayerCache(config, is_kv_sconv=True, is_swa=False, batch_size=batch_size),
+            ShortConvLayerCache(config, is_kv_sconv=False, batch_size=batch_size),
+            ShortConvLayerCache(config, is_kv_sconv=False, batch_size=batch_size),
         ]
+
+        self.batch_size = batch_size
         self.kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
 
-        self.k_cache: Fp[T, "1 hk capacity c"] | None = None
-        self.v_cache: Fp[T, "1 hk capacity c"] | None = None
+        self.k_cache: Fp[T, "bs hk capacity c"] | None = None
+        self.v_cache: Fp[T, "bs hk capacity c"] | None = None
         self.curr_size = 0
         self.tokens_seen = 0
         self.key_positions: T | None = None
 
     def allocate(
-        self, reference: Fp[T, "1 hk reference_length c"], size: int = 256
-    ) -> Fp[T, "1 hk size c"]:
-        return reference.new_zeros((1, self.kv_heads, size, self.head_dim))
+        self, reference: Fp[T, "bs hk reference_length c"], size: int = 256
+    ) -> Fp[T, "bs hk size c"]:
+        return reference.new_zeros((self.batch_size, self.kv_heads, size, self.head_dim))
 
     def extend_cache(self) -> None:
         assert self.k_cache is not None and self.v_cache is not None
@@ -105,9 +111,9 @@ class FullAttentionLayerCache:
 
     def update_cache(
         self,
-        key_states: Fp[T, "1 hk s c"],
-        value_states: Fp[T, "1 hk s c"],
-    ) -> tuple[Fp[T, "1 hk k_len c"], Fp[T, "1 hk k_len c"]]:
+        key_states: Fp[T, "bs hk s c"],
+        value_states: Fp[T, "bs hk s c"],
+    ) -> tuple[Fp[T, "bs hk k_len c"], Fp[T, "bs hk k_len c"]]:
         if self.k_cache is None:
             self.k_cache = self.allocate(key_states)
             self.v_cache = self.allocate(value_states)
@@ -132,34 +138,35 @@ class SlidingWindowAttentionLayerCache:
     Contains cache for sliding window attention
     """
 
-    def __init__(self, config: "InklingTextConfig"):
+    def __init__(self, config: "InklingTextConfig", batch_size: int = 16):
         self.conv_caches = [
-            ShortConvLayerCache(config, is_kv_sconv=True, is_swa=True),
-            ShortConvLayerCache(config, is_kv_sconv=True, is_swa=True),
-            ShortConvLayerCache(config, is_kv_sconv=False),
-            ShortConvLayerCache(config, is_kv_sconv=False),
+            ShortConvLayerCache(config, is_kv_sconv=True, is_swa=True, batch_size=batch_size),
+            ShortConvLayerCache(config, is_kv_sconv=True, is_swa=True, batch_size=batch_size),
+            ShortConvLayerCache(config, is_kv_sconv=False, batch_size=batch_size),
+            ShortConvLayerCache(config, is_kv_sconv=False, batch_size=batch_size),
         ]
 
+        self.batch_size = batch_size
         self.sliding_window_size = config.sliding_window_size
 
-        self.k_cache: Fp[T, "1 hk capacity c"] | None = None
-        self.v_cache: Fp[T, "1 hk capacity c"] | None = None
+        self.k_cache: Fp[T, "bs hk capacity c"] | None = None
+        self.v_cache: Fp[T, "bs hk capacity c"] | None = None
         self.curr_size = 0
         self.tokens_seen = 0
         self.key_positions: T | None = None
 
     def update_cache(
         self,
-        key_states: Fp[T, "1 hk s c"],
-        value_states: Fp[T, "1 hk s c"],
-    ) -> tuple[Fp[T, "1 hk k_len c"], Fp[T, "1 hk k_len c"]]:
+        key_states: Fp[T, "bs hk s c"],
+        value_states: Fp[T, "bs hk s c"],
+    ) -> tuple[Fp[T, "bs hk k_len c"], Fp[T, "bs hk k_len c"]]:
         roll_size = key_states.shape[2]
         # TODO: fix cases where prefill prompt > sliding window size
         assert roll_size <= self.sliding_window_size
 
         if self.k_cache is None:
             shape = (
-                1,
+                self.batch_size,
                 key_states.shape[1],
                 2 * self.sliding_window_size,
                 key_states.shape[3],
@@ -191,18 +198,19 @@ class SlidingWindowAttentionLayerCache:
 
 
 class MyInklingCache:
-    def __init__(self, config: "InklingTextConfig"):
+    def __init__(self, config: "InklingTextConfig", batch_size: int = 16):
         layer_classes = {
             "hybrid": FullAttentionLayerCache,
             "hybrid_sliding": SlidingWindowAttentionLayerCache,
         }
         self.layers = [
-            layer_classes[layer_type](config) for layer_type in config.layer_types
+            layer_classes[layer_type](config, batch_size) for layer_type in config.layer_types
         ]
         self.position = None
 
     def prepare_decode(self, capacity: int) -> None:
-        """Freeze a populated batch-one cache for at most `capacity` total tokens.
+        """
+        Freeze a populated batch-one cache for at most `capacity` total tokens.
 
         Sliding keys retain their physical ring order; attention masks use GPU
         distances instead of moving keys or changing tensor shapes each token.
@@ -251,10 +259,10 @@ class MyInklingCache:
 
     def update_attn_cache(
         self,
-        key_states: Fp[T, "1 hk s c"],
-        value_states: Fp[T, "1 hk s c"],
+        key_states: Fp[T, "bs hk s c"],
+        value_states: Fp[T, "bs hk s c"],
         layer_idx: int,
-    ) -> tuple[Fp[T, "1 hk k_len c"], Fp[T, "1 hk k_len c"]]:
+    ) -> tuple[Fp[T, "bs hk k_len c"], Fp[T, "bs hk k_len c"]]:
         if self.position is not None:
             assert key_states.shape[0] == key_states.shape[2] == 1
             layer = self.layers[layer_idx]
@@ -273,10 +281,10 @@ class MyInklingCache:
 
     def update_conv_cache(
         self,
-        hidden_states: Fp[T, "1 d s"],
+        hidden_states: Fp[T, "bs d s"],
         layer_idx: int,
         conv_idx: int,
-    ) -> Fp[T, "1 d conv_kernel_size"]:
+    ) -> Fp[T, "bs d conv_kernel_size"]:
         return self.layers[layer_idx].conv_caches[conv_idx].update_cache(hidden_states)
 
     def has_previous_state(self, layer_idx: int, conv_idx: int) -> bool:
