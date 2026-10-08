@@ -408,7 +408,6 @@ class MyInklingShortConv(nn.Module):
             self.layer_idx, self.conv_idx
         ):
             # Decode: the kernel shifts the cached history in place.
-            assert hidden_states.shape[:2] == (1, 1)
             history = cache.layers[self.layer_idx].conv_caches[self.conv_idx].cache
             return short_conv(hidden_states, self.conv1d.weight, history, residual)
         input_dtype = hidden_states.dtype

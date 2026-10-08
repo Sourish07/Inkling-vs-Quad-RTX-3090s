@@ -7,7 +7,7 @@ import torch.distributed as dist
 class DecodeGraph:
     @torch.inference_mode()
     def __init__(self, model, cache, next_token, capacity, capture=True):
-        assert next_token.is_cuda and next_token.shape == (1, 1)
+        assert next_token.is_cuda
         assert not model.training
         self.model = model
         self.cache = cache

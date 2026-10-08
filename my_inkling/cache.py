@@ -201,6 +201,7 @@ class MyInklingCache:
             "hybrid": FullAttentionLayerCache,
             "hybrid_sliding": SlidingWindowAttentionLayerCache,
         }
+        self.batch_size = batch_size
         self.layers = [
             layer_classes[layer_type](config, batch_size) for layer_type in config.layer_types
         ]
@@ -217,12 +218,14 @@ class MyInklingCache:
         assert self.position is None
         seen = self.layers[0].tokens_seen
         assert 0 < seen < capacity
+
         for layer in self.layers:
             assert layer.tokens_seen == seen
             assert all(conv.initialized for conv in layer.conv_caches)
             assert layer.k_cache is not None and layer.v_cache is not None
+
             if isinstance(layer, FullAttentionLayerCache):
-                shape = (1, layer.kv_heads, capacity, layer.head_dim)
+                shape = (self.batch_size, layer.kv_heads, capacity, layer.head_dim)
                 key = layer.k_cache.new_zeros(shape)
                 value = layer.v_cache.new_zeros(shape)
                 key[:, :, :seen].copy_(layer.k_cache[:, :, :seen])
@@ -231,8 +234,10 @@ class MyInklingCache:
                 window = layer.sliding_window_size
                 key = layer.k_cache[:, :, :window].clone()
                 value = layer.v_cache[:, :, :window].clone()
+
             layer.k_cache, layer.v_cache = key, value
             layer.key_positions = torch.arange(key.shape[2], device=key.device)
+
         self.position = torch.tensor(seen, dtype=torch.int64, device=key.device)
 
     def decode_distance(self, layer_idx: int) -> T:

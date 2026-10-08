@@ -69,6 +69,8 @@ def _short_conv(
     History,
     Residual,
     Y,
+    X_STRIDE: tl.constexpr,
+    R_STRIDE: tl.constexpr,
     D: tl.constexpr,
     K: tl.constexpr,
     ADD_RESIDUAL: tl.constexpr,
@@ -81,43 +83,64 @@ def _short_conv(
     no separate cache update. ADD_RESIDUAL also adds the decoder residual in the
     same launch.
     """
-    d = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    X += tl.program_id(0) * X_STRIDE[0]
+    History += tl.program_id(0) * D * K
+    Residual += tl.program_id(0) * R_STRIDE[0]
+    Y += tl.program_id(0) * D
+
+    d = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     current = tl.load(X + d, d < D, 0).to(tl.float32)
     total = tl.full((BLOCK,), 0, tl.float32)
+
     # A channel belongs to one lane: load each old value before overwriting it.
     for j in tl.static_range(K - 1):
         previous = tl.load(History + d * K + j + 1, d < D, 0)
         weight = tl.load(W + d * K + j, d < D, 0).to(tl.float32)
         total += previous * weight
         tl.store(History + d * K + j, previous, d < D)
+
     weight = tl.load(W + d * K + K - 1, d < D, 0).to(tl.float32)
     total += current * weight
     tl.store(History + d * K + K - 1, current, d < D)
+
     output = (total + current).to(Y.dtype.element_ty)
+
     if ADD_RESIDUAL:
         residual = tl.load(Residual + d, d < D, 0).to(tl.float32)
         output = output.to(tl.float32) + residual
+
     tl.store(Y + d, output, d < D)
 
 
 def short_conv(
-    x: Fp[T, "1 1 d"],
+    x: Fp[T, "bs 1 d"],
     weight: Fp[T, "d 1 conv_kernel_size"],
-    history: Fp[T, "1 d conv_kernel_size"],
-    residual: Fp[T, "1 1 d"] | None = None,
-) -> Fp[T, "1 1 d"]:
-    output = torch.empty_like(x)
-    width = x.shape[-1]
-    _short_conv[(triton.cdiv(width, 256),)](
+    history: Fp[T, "bs d conv_kernel_size"],
+    residual: Fp[T, "bs 1 d"] | None = None,
+) -> Fp[T, "bs 1 d"]:
+    # An assumption the kernel currently makes
+    assert x.stride(-1) == 1
+    if residual is not None:
+        assert residual.stride(-1) == 1
+
+    batch_size, _, width = x.shape
+    kernel_size = weight.shape[-1]
+
+    output = torch.empty_like(x, memory_format=torch.contiguous_format)
+
+    block_size = 256
+    _short_conv[(batch_size, triton.cdiv(width, block_size))](
         x,
         weight,
         history,
         residual if residual is not None else x,
         output,
+        tuple(x.stride()),
+        tuple(residual.stride()) if residual is not None else tuple(x.stride()),
         width,
-        weight.shape[-1],
+        kernel_size,
         residual is not None,
-        256,
+        block_size,
         enable_fp_fusion=False,
     )
     return output

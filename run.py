@@ -135,7 +135,7 @@ def main(
 
             host_token = next_input.cpu()
             if streamer is not None:
-                streamer.put(host_token)
+                streamer.put(host_token[:1])
 
             finished |= host_token[:, 0] == tokenizer.eos_token_id
 
