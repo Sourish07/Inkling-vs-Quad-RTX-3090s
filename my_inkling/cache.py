@@ -67,8 +67,6 @@ class ShortConvLayerCache:
 
         roll_size = min(tokens.shape[2], self.conv_kernel_size)
         self.cache = torch.roll(self.cache, -roll_size, dims=-1)
-        print("self.cache", self.cache.shape)
-        print("tokens", tokens.shape)
         self.cache[..., -roll_size:].copy_(tokens[:, :, -roll_size:])
 
         self.initialized = True
