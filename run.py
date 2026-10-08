@@ -98,9 +98,7 @@ def main(
         padding=True,
     )
     seq_lens = inputs["attention_mask"].sum(dim=1)
-    print("seq_lens", seq_lens)
     inputs = inputs.to(device)
-    print("inputs", inputs)
     num_tokens = inputs["input_ids"].shape[1]
     logger.info(f"running generation with {num_tokens} input tokens")
 

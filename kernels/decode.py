@@ -1,5 +1,5 @@
 """
-Small inference kernels; convolution history is FP32 and decode is batch one.
+Small inference kernels; convolution history is FP32.
 """
 
 import torch
@@ -148,7 +148,12 @@ def _update_kv(
     contiguous copy. A nonzero WINDOW selects the sliding cache: positions wrap
     and each token is written twice, WINDOW apart.
     """
-    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    K += tl.program_id(0) * K_STRIDES[0]
+    V += tl.program_id(0) * V_STRIDES[0]
+    KCache += tl.program_id(0) * HEADS * CAPACITY * D
+    VCache += tl.program_id(0) * HEADS * CAPACITY * D
+
+    i = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     channel = i % D
     token = i // D % S
     head = i // (D * S)
@@ -176,16 +181,22 @@ def _update_kv(
 
 
 def update_kv(
-    key: Fp[T, "1 hk s c"],
-    value: Fp[T, "1 hk s c"],
-    k_cache: Fp[T, "1 hk capacity c"],
-    v_cache: Fp[T, "1 hk capacity c"],
-    start: int | Int[T, ""],
+    key: Fp[T, "bs hk s c"],
+    value: Fp[T, "bs hk s c"],
+    k_cache: Fp[T, "bs hk capacity c"],
+    v_cache: Fp[T, "bs hk capacity c"],
+    start: int | Int[T, ""],  # Start will remain the same for all sequences for now
     window: int = 0,
     mirror: bool = True,
 ) -> None:
-    assert key.shape[0] == 1
-    _update_kv[(triton.cdiv(key.numel(), 256),)](
+    batch_size = key.shape[0]
+    block_size = 256
+    grid = (
+        batch_size,
+        triton.cdiv(key[0].numel(), block_size),
+    )
+
+    _update_kv[grid](
         key,
         value,
         k_cache,
@@ -200,5 +211,5 @@ def update_kv(
         isinstance(start, torch.Tensor),
         window,
         mirror,
-        256,
+        block_size,
     )
