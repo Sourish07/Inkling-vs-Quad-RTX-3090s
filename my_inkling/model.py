@@ -541,7 +541,7 @@ class MyInklingAttention(nn.Module):
         if static_decode:
             distance = cache.decode_distance(self.layer_idx)
             position_bias = self.rel_logits_proj(relative_states, distance)
-            allowed = (distance >= 0) & (distance <= cache.position)
+            allowed = (distance >= 0) & (distance <= cache.position - cache.pad_counts)
             sdpa_mask = position_bias.masked_fill(~allowed, float("-inf"))
         else:
             # Relative distances do not depend on the absolute cache position.

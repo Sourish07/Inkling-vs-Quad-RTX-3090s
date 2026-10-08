@@ -100,9 +100,9 @@ def main(
         reasoning_effort="none",
         padding=True,
     )
-    seq_lens = inputs["attention_mask"].sum(dim=1)
     inputs = inputs.to(device)
     num_tokens = inputs["input_ids"].shape[1]
+    pad_count = num_tokens - inputs["attention_mask"].sum(dim=1)
     logger.info(f"running generation with {num_tokens} input tokens")
 
     model.eval()
@@ -115,7 +115,7 @@ def main(
     # Step 0 is prefill (+ first token); the decode clock starts after it.
     decode_start = 0.0
     num_decode_tokens = 0
-    cache = MyInklingCache(config.text_config, batch_size=batch_size)
+    cache = MyInklingCache(config.text_config, batch_size=batch_size, pad_counts=pad_count)
     decode_graph = None
 
     profiler = Profiler(enable=profile)
@@ -176,10 +176,10 @@ def main(
             f"= {num_decode_tokens / decode_time:.2f} tok/s (excl. prefill)"
         )
 
-        # outputs = torch.cat(outputs, dim=1)
-        # for i in range(outputs.shape[0]):
-        #     print(f"\n\nExample {i}:")
-        #     print(tokenizer.decode(outputs[i]))
+        outputs = torch.cat(outputs, dim=1)
+        for i in range(outputs.shape[0]):
+            print(f"\n\nExample {i}:")
+            print(tokenizer.decode(outputs[i]))
 
     # NCCL communicator shutdown waits for every captured graph to be released.
     if decode_graph is not None and decode_graph.graph is not None:

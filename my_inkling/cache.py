@@ -196,12 +196,14 @@ class SlidingWindowAttentionLayerCache:
 
 
 class MyInklingCache:
-    def __init__(self, config: "InklingTextConfig", batch_size: int = 16):
+    def __init__(self, config: "InklingTextConfig", batch_size: int = 16, pad_counts: torch.Tensor | None = None):
         layer_classes = {
             "hybrid": FullAttentionLayerCache,
             "hybrid_sliding": SlidingWindowAttentionLayerCache,
         }
         self.batch_size = batch_size
+        self.pad_counts = pad_counts
+
         self.layers = [
             layer_classes[layer_type](config, batch_size) for layer_type in config.layer_types
         ]
