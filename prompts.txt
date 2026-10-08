@@ -1,0 +1,17 @@
+What are the computational benefits of Mixture-of-Experts models?
+What are the computational benefits of Mixture-of-Experts models?
+Explain backpropagation.
+Why do transformers need positional encodings?
+What is the difference between batch normalization and layer normalization, and when would you choose one over the other?
+Explain the bias-variance tradeoff to someone who has only taken an introductory statistics course.
+How does the attention mechanism work?
+Describe how the Adam optimizer works, including the role of the first and second moment estimates and why bias correction is needed in the early steps of training.
+What is a KV cache, and why does it speed up autoregressive text generation?
+Explain quantization in the context of large language models. What do terms like 4-bit and 8-bit mean, how do they affect memory use and inference speed, and what does the model lose in exchange?
+Why do residual connections help train very deep networks?
+What is the vanishing gradient problem?
+Walk me through how a diffusion model generates an image, starting from pure noise and ending at the final sample. Cover the forward and reverse processes, what the network is actually trained to predict, and why sampling takes many steps.
+Compare LoRA with full fine-tuning.
+I keep hearing that dropout acts as a regularizer, but I do not understand why randomly zeroing activations during training would make a model generalize better at test time. Can you explain the intuition and also what changes at inference?
+What is the difference between tensor parallelism and pipeline parallelism when splitting a large model across multiple GPUs, and how does each one affect throughput and latency?
+Explain how byte-pair encoding tokenization works, step by step, using a small example vocabulary, and then discuss why subword tokenization became the standard over word-level and character-level approaches.
