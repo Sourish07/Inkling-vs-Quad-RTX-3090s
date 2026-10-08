@@ -118,6 +118,8 @@ def main(
     profiler = Profiler(enable=profile)
     profiler.start()
 
+    finished = torch.zeros(batch_size, dtype=torch.bool)
+
     with torch.inference_mode():
         for step in range(max_new_tokens):
             # Names each forward pass in the profiler trace.
@@ -134,10 +136,11 @@ def main(
             host_token = next_input.cpu()
             if streamer is not None:
                 streamer.put(host_token)
-            is_eos = all(host_token.item() == tokenizer.eos_token_id for _ in range(host_token.shape[0]))
+
+            finished |= host_token[:, 0] == tokenizer.eos_token_id
 
             if step == 0:
-                if not is_eos and max_new_tokens > 1:
+                if max_new_tokens > 1:
                     logger.info(
                         "Warming up and capturing complete decode CUDA graph"
                         if cuda_graph
@@ -154,7 +157,7 @@ def main(
             else:
                 num_decode_tokens += 1
 
-            if is_eos:
+            if finished.all():
                 break
 
     if streamer is not None:
