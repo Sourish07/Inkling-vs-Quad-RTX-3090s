@@ -267,7 +267,7 @@ class MyInklingCache:
         layer_idx: int,
     ) -> tuple[Fp[T, "bs hk k_len c"], Fp[T, "bs hk k_len c"]]:
         if self.position is not None:
-            assert key_states.shape[0] == key_states.shape[2] == 1
+            assert key_states.shape[2] == 1
             layer = self.layers[layer_idx]
             window = getattr(layer, "sliding_window_size", 0)
             update_kv(

@@ -122,6 +122,7 @@ def main(
     profiler.start()
 
     finished = torch.zeros(batch_size, dtype=torch.bool)
+    outputs = []
 
     with torch.inference_mode():
         for step in range(max_new_tokens):
@@ -137,6 +138,7 @@ def main(
                     next_input = decode_graph.replay()
 
             host_token = next_input.cpu()
+            outputs.append(host_token)
             if streamer is not None:
                 streamer.put(host_token[:1])
 
@@ -173,6 +175,11 @@ def main(
             f"Decode: {num_decode_tokens} tokens in {decode_time:.2f}s "
             f"= {num_decode_tokens / decode_time:.2f} tok/s (excl. prefill)"
         )
+
+        # outputs = torch.cat(outputs, dim=1)
+        # for i in range(outputs.shape[0]):
+        #     print(f"\n\nExample {i}:")
+        #     print(tokenizer.decode(outputs[i]))
 
     # NCCL communicator shutdown waits for every captured graph to be released.
     if decode_graph is not None and decode_graph.graph is not None:
