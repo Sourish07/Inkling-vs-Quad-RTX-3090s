@@ -5,6 +5,9 @@ Small inference kernels; convolution history is FP32 and decode is batch one.
 import torch
 import triton
 import triton.language as tl
+from jaxtyping import Float as Fp
+from jaxtyping import Int
+from torch import Tensor as T
 
 
 @triton.jit
@@ -40,7 +43,9 @@ def _rms_norm(
     tl.store(Y + row * D + d, normalized * weight, d < D)
 
 
-def rms_norm(x, weight, eps):
+def rms_norm(
+    x: Fp[T, "*batch d"], weight: Fp[T, " d"], eps: float
+) -> Fp[T, "*batch d"]:
     output = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     width = x.shape[-1]
     _rms_norm[(x.numel() // width,)](
@@ -95,7 +100,12 @@ def _short_conv(
     tl.store(Y + d, output, d < D)
 
 
-def short_conv(x, weight, history, residual=None):
+def short_conv(
+    x: Fp[T, "1 1 d"],
+    weight: Fp[T, "d 1 conv_kernel_size"],
+    history: Fp[T, "1 d conv_kernel_size"],
+    residual: Fp[T, "1 1 d"] | None = None,
+) -> Fp[T, "1 1 d"]:
     output = torch.empty_like(x)
     width = x.shape[-1]
     _short_conv[(triton.cdiv(width, 256),)](
@@ -165,7 +175,15 @@ def _update_kv(
         tl.store(VCache + destination + WINDOW * D, value, i < HEADS * S * D)
 
 
-def update_kv(key, value, k_cache, v_cache, start, window=0, mirror=True):
+def update_kv(
+    key: Fp[T, "1 hk s c"],
+    value: Fp[T, "1 hk s c"],
+    k_cache: Fp[T, "1 hk capacity c"],
+    v_cache: Fp[T, "1 hk capacity c"],
+    start: int | Int[T, ""],
+    window: int = 0,
+    mirror: bool = True,
+) -> None:
     assert key.shape[0] == 1
     _update_kv[(triton.cdiv(key.numel(), 256),)](
         key,
