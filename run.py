@@ -17,6 +17,7 @@ from my_inkling import MyInkling, MyInklingCache, apply_ep_plan, apply_tp_plan
 from my_inkling.decode_graph import DecodeGraph
 from utils import (
     Profiler,
+    Timer,
     get_device_mesh,
     load_config,
     load_expert_state_dict,
@@ -31,7 +32,7 @@ hf_repo = "thinkingmachines/Inkling-Small-NVFP4"
 def main(
     profile: bool = False,
     log2_max_new_tokens: int = 7,
-    gpu_experts_per_rank: int = 24,
+    gpu_experts_per_rank: int = 20,
     cuda_graph: bool = True,
     batch_size: int = 1,
 ) -> None:
@@ -63,9 +64,10 @@ def main(
             apply_tp_plan(model, config, device_mesh)
 
     logger.info("Loading state dict into sharded model")
-    non_expert_state_dict = load_non_expert_state_dict(
-        model, local_hf_path, device_mesh
-    )
+    with Timer("Non-expert checkpoint loading"):
+        non_expert_state_dict = load_non_expert_state_dict(
+            model, local_hf_path, device_mesh
+        )
     missing, unexpected = model.load_state_dict(
         non_expert_state_dict, strict=False, assign=True
     )
@@ -73,9 +75,10 @@ def main(
     del non_expert_state_dict
     model.fuse_attention_projections()
 
-    expert_state_dict = load_expert_state_dict(
-        model, local_hf_path, device_mesh, gpu_experts_per_rank
-    )
+    with Timer("Expert checkpoint loading"):
+        expert_state_dict = load_expert_state_dict(
+            model, local_hf_path, device_mesh, gpu_experts_per_rank
+        )
     apply_ep_plan(model, device_mesh, expert_state_dict, num_slots=10)
 
     torch.distributed.barrier()

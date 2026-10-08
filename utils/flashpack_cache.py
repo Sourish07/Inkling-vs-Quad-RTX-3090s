@@ -51,7 +51,7 @@ def cache_directory(model, checkpoint_dir, mesh, *, experts=False, gpu_experts=N
         :20
     ]
     root = Path(
-        os.environ.get("INKLING_FLASHPACK_CACHE", checkpoint_dir / ".flashpack")
+        os.environ.get("INKLING_FLASHPACK_CACHE", Path(__file__).resolve().parent.parent / ".flashpack")
     )
     return root / ("experts" if experts else "non-experts") / digest
 
