@@ -307,7 +307,8 @@ def load_weights(
 
 @torch.no_grad()
 def generate(model, input_ids, *, max_new_tokens, eos_token_ids):
-    cache = MyInklingCache(model.config.text_config)
+    capacity = input_ids.shape[1] + max_new_tokens
+    cache = MyInklingCache(model.config.text_config, input_ids.shape[0], capacity)
     for step in range(max_new_tokens):
         started = time.monotonic()
         logits = model(input_ids, cache=cache)[:, -1].float()

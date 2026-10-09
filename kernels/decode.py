@@ -161,15 +161,13 @@ def _update_kv(
     START,
     DEVICE_START: tl.constexpr,
     WINDOW: tl.constexpr,
-    MIRROR: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """
     Copy the new key and value tokens into both caches, starting at START.
 
     K and V are read through their strides, so the transposed head views need no
-    contiguous copy. A nonzero WINDOW selects the sliding cache: positions wrap
-    and each token is written twice, WINDOW apart.
+    contiguous copy. A nonzero WINDOW selects the sliding cache: positions wrap.
     """
     K += tl.program_id(0) * K_STRIDES[0]
     V += tl.program_id(0) * V_STRIDES[0]
@@ -197,10 +195,6 @@ def _update_kv(
     destination = (head * CAPACITY + position) * D + channel
     tl.store(KCache + destination, key, i < HEADS * S * D)
     tl.store(VCache + destination, value, i < HEADS * S * D)
-    if WINDOW and MIRROR:
-        # Mirrored ring: the newest window is always a contiguous chronological view.
-        tl.store(KCache + destination + WINDOW * D, key, i < HEADS * S * D)
-        tl.store(VCache + destination + WINDOW * D, value, i < HEADS * S * D)
 
 
 def update_kv(
@@ -210,7 +204,6 @@ def update_kv(
     v_cache: Fp[T, "bs hk capacity c"],
     start: int | Int[T, ""],  # Start will remain the same for all sequences for now
     window: int = 0,
-    mirror: bool = True,
 ) -> None:
     batch_size = key.shape[0]
     block_size = 256
@@ -233,6 +226,5 @@ def update_kv(
         start,
         isinstance(start, torch.Tensor),
         window,
-        mirror,
         block_size,
     )

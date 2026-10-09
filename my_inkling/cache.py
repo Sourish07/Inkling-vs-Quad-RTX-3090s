@@ -1,5 +1,7 @@
 """
-Cache shape names (batch size is currently fixed to 1).
+Cache shape names.
+
+bs               = batch size
 
 d                = feature/channel width
 hk               = key/value heads
@@ -9,8 +11,8 @@ conv_kernel_size = short-convolution buffer length
 capacity         = allocated full-attention buffer length
 k_len            = returned sliding-window buffer length
 
-Buffers are allocated on the first update, using the input tensor's device.
-K/V buffers also inherit the input dtype; convolution histories stay in FP32.
+K/V buffers are allocated once, at construction, with their final capacity.
+Convolution histories are allocated on the first update and stay in FP32.
 """
 
 from typing import TYPE_CHECKING
@@ -79,139 +81,112 @@ class FullAttentionLayerCache:
     Contains cache for full attention
     """
 
-    def __init__(self, config: "InklingTextConfig", batch_size: int = 16):
+    def __init__(
+        self, config: "InklingTextConfig", batch_size: int, capacity: int, dtype, device
+    ):
         self.conv_caches = [
-            ShortConvLayerCache(config, is_kv_sconv=True, is_swa=False, batch_size=batch_size),
-            ShortConvLayerCache(config, is_kv_sconv=True, is_swa=False, batch_size=batch_size),
+            ShortConvLayerCache(
+                config, is_kv_sconv=True, is_swa=False, batch_size=batch_size
+            ),
+            ShortConvLayerCache(
+                config, is_kv_sconv=True, is_swa=False, batch_size=batch_size
+            ),
             ShortConvLayerCache(config, is_kv_sconv=False, batch_size=batch_size),
             ShortConvLayerCache(config, is_kv_sconv=False, batch_size=batch_size),
         ]
 
-        self.batch_size = batch_size
-        self.kv_heads = config.num_key_value_heads
-        self.head_dim = config.head_dim
-
-        self.k_cache: Fp[T, "bs hk capacity c"] | None = None
-        self.v_cache: Fp[T, "bs hk capacity c"] | None = None
-        self.curr_size = 0
+        shape = (batch_size, config.num_key_value_heads, capacity, config.head_dim)
+        self.k_cache: Fp[T, "bs hk capacity c"] = torch.zeros(
+            shape, dtype=dtype, device=device
+        )
+        self.v_cache: Fp[T, "bs hk capacity c"] = torch.zeros_like(self.k_cache)
         self.tokens_seen = 0
         self.key_positions: T | None = None
-
-    def allocate(
-        self, reference: Fp[T, "bs hk reference_length c"], size: int = 256
-    ) -> Fp[T, "bs hk size c"]:
-        return reference.new_zeros((self.batch_size, self.kv_heads, size, self.head_dim))
-
-    def extend_cache(self) -> None:
-        assert self.k_cache is not None and self.v_cache is not None
-        self.k_cache = torch.cat([self.k_cache, self.allocate(self.k_cache)], dim=2)
-        self.v_cache = torch.cat([self.v_cache, self.allocate(self.v_cache)], dim=2)
 
     def update_cache(
         self,
         key_states: Fp[T, "bs hk s c"],
         value_states: Fp[T, "bs hk s c"],
     ) -> tuple[Fp[T, "bs hk k_len c"], Fp[T, "bs hk k_len c"]]:
-        if self.k_cache is None:
-            self.k_cache = self.allocate(key_states)
-            self.v_cache = self.allocate(value_states)
-
-        seq_len = key_states.shape[2]
-
-        old_size = self.curr_size
-        new_size = old_size + seq_len
-
-        while new_size > self.k_cache.shape[2]:
-            self.extend_cache()
+        old_size = self.tokens_seen
+        new_size = old_size + key_states.shape[2]
+        # A sliding layer rolls over only in decode, where a mask selects its keys.
+        assert new_size <= self.k_cache.shape[2], "K/V cache capacity exhausted"
 
         update_kv(key_states, value_states, self.k_cache, self.v_cache, old_size)
 
-        self.curr_size = new_size
-        self.tokens_seen += seq_len
+        self.tokens_seen = new_size
         return self.k_cache[:, :, :new_size], self.v_cache[:, :, :new_size]
 
 
-class SlidingWindowAttentionLayerCache:
+class SlidingWindowAttentionLayerCache(FullAttentionLayerCache):
     """
     Contains cache for sliding window attention
+
+    Prefill fills one window in order, as in full attention; decode writes a ring.
     """
 
-    def __init__(self, config: "InklingTextConfig", batch_size: int = 16):
+    def __init__(
+        self, config: "InklingTextConfig", batch_size: int, capacity: int, dtype, device
+    ):
+        """`capacity` is unused: the window size fixes the ring length."""
         self.conv_caches = [
-            ShortConvLayerCache(config, is_kv_sconv=True, is_swa=True, batch_size=batch_size),
-            ShortConvLayerCache(config, is_kv_sconv=True, is_swa=True, batch_size=batch_size),
+            ShortConvLayerCache(
+                config, is_kv_sconv=True, is_swa=True, batch_size=batch_size
+            ),
+            ShortConvLayerCache(
+                config, is_kv_sconv=True, is_swa=True, batch_size=batch_size
+            ),
             ShortConvLayerCache(config, is_kv_sconv=False, batch_size=batch_size),
             ShortConvLayerCache(config, is_kv_sconv=False, batch_size=batch_size),
         ]
 
-        self.batch_size = batch_size
         self.sliding_window_size = config.sliding_window_size
 
-        self.k_cache: Fp[T, "bs hk capacity c"] | None = None
-        self.v_cache: Fp[T, "bs hk capacity c"] | None = None
-        self.curr_size = 0
+        shape = (
+            batch_size,
+            config.swa_num_key_value_heads,
+            self.sliding_window_size,
+            config.swa_head_dim,
+        )
+        self.k_cache: Fp[T, "bs hk capacity c"] = torch.zeros(
+            shape, dtype=dtype, device=device
+        )
+        self.v_cache: Fp[T, "bs hk capacity c"] = torch.zeros_like(self.k_cache)
         self.tokens_seen = 0
         self.key_positions: T | None = None
 
-    def update_cache(
-        self,
-        key_states: Fp[T, "bs hk s c"],
-        value_states: Fp[T, "bs hk s c"],
-    ) -> tuple[Fp[T, "bs hk k_len c"], Fp[T, "bs hk k_len c"]]:
-        roll_size = key_states.shape[2]
-        # TODO: fix cases where prefill prompt > sliding window size
-        assert roll_size <= self.sliding_window_size
-
-        if self.k_cache is None:
-            shape = (
-                self.batch_size,
-                key_states.shape[1],
-                2 * self.sliding_window_size,
-                key_states.shape[3],
-            )
-            self.k_cache = key_states.new_zeros(shape)
-            self.v_cache = value_states.new_zeros(shape)
-
-        self.curr_size = min(self.curr_size + roll_size, self.sliding_window_size)
-
-        # Mirror each position so rollover never needs to move existing tokens.
-        update_kv(
-            key_states,
-            value_states,
-            self.k_cache,
-            self.v_cache,
-            self.tokens_seen % self.sliding_window_size,
-            self.sliding_window_size,
-        )
-
-        self.tokens_seen += roll_size
-
-        end = (
-            self.sliding_window_size
-            + (self.tokens_seen - 1) % self.sliding_window_size
-            + 1
-        )
-        start = end - self.curr_size
-        return self.k_cache[:, :, start:end], self.v_cache[:, :, start:end]
-
 
 class MyInklingCache:
-    def __init__(self, config: "InklingTextConfig", batch_size: int = 16, pad_counts: torch.Tensor | None = None):
+    def __init__(
+        self,
+        config: "InklingTextConfig",
+        batch_size: int,
+        capacity: int,
+        pad_counts: T | None = None,
+        dtype: torch.dtype = torch.bfloat16,
+        device: torch.device | str = "cuda",
+    ):
+        """`capacity` is the most tokens one request can hold: prompt plus output."""
+        if pad_counts is None:
+            pad_counts = torch.zeros(batch_size, dtype=torch.int64, device=device)
+        self.pad_counts = pad_counts
+        self.capacity = capacity
+
         layer_classes = {
             "hybrid": FullAttentionLayerCache,
             "hybrid_sliding": SlidingWindowAttentionLayerCache,
         }
-        self.batch_size = batch_size
-        self.pad_counts = pad_counts
 
         self.layers = [
-            layer_classes[layer_type](config, batch_size) for layer_type in config.layer_types
+            layer_classes[layer_type](config, batch_size, capacity, dtype, device)
+            for layer_type in config.layer_types
         ]
         self.position = None
 
-    def prepare_decode(self, capacity: int) -> None:
+    def prepare_decode(self) -> None:
         """
-        Freeze a populated batch-one cache for at most `capacity` total tokens.
+        Freeze a populated cache for decode.
 
         Sliding keys retain their physical ring order; attention masks use GPU
         distances instead of moving keys or changing tensor shapes each token.
@@ -219,28 +194,16 @@ class MyInklingCache:
         """
         assert self.position is None
         seen = self.layers[0].tokens_seen
-        assert 0 < seen < capacity
+        assert 0 < seen < self.capacity
 
         for layer in self.layers:
             assert layer.tokens_seen == seen
             assert all(conv.initialized for conv in layer.conv_caches)
-            assert layer.k_cache is not None and layer.v_cache is not None
 
-            if isinstance(layer, FullAttentionLayerCache):
-                shape = (self.batch_size, layer.kv_heads, capacity, layer.head_dim)
-                key = layer.k_cache.new_zeros(shape)
-                value = layer.v_cache.new_zeros(shape)
-                key[:, :, :seen].copy_(layer.k_cache[:, :, :seen])
-                value[:, :, :seen].copy_(layer.v_cache[:, :, :seen])
-            else:
-                window = layer.sliding_window_size
-                key = layer.k_cache[:, :, :window].clone()
-                value = layer.v_cache[:, :, :window].clone()
+            device = layer.k_cache.device
+            layer.key_positions = torch.arange(layer.k_cache.shape[2], device=device)
 
-            layer.k_cache, layer.v_cache = key, value
-            layer.key_positions = torch.arange(key.shape[2], device=key.device)
-
-        self.position = torch.tensor(seen, dtype=torch.int64, device=key.device)
+        self.position = torch.tensor(seen, dtype=torch.int64, device=device)
 
     def decode_distance(self, layer_idx: int) -> T:
         layer = self.layers[layer_idx]
@@ -279,7 +242,6 @@ class MyInklingCache:
                 layer.v_cache,
                 self.position,
                 window,
-                mirror=False,
             )
             return layer.k_cache, layer.v_cache
         return self.layers[layer_idx].update_cache(key_states, value_states)

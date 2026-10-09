@@ -309,14 +309,20 @@ def test_attention_cached_fp32(layer_idx: int, text_config: InklingTextConfig) -
     mask = torch.zeros(1, 1, 10, 10).masked_fill(~allowed, float("-inf"))
     expected, _ = reference(states, attention_mask=mask)
     actual = actual.cuda()
-    cache = MyInklingCache(text_config)
-    chunks = [2] + [1] * 8
-    start = 0
-    for size in chunks:
-        end = start + size
-        output = actual(states[:, start:end].cuda(), cache).cpu()
-        assert_fp32_close(output, expected[:, start:end])
-        start = end
+    cache = MyInklingCache(text_config, 1, states.shape[1], dtype=torch.float32)
+    prefill = 2
+    output = actual(states[:, :prefill].cuda(), cache).cpu()
+    assert_fp32_close(output, expected[:, :prefill])
+    # Only this layer's K/V convolutions ran; mark the rest so the cache can freeze.
+    for layer in cache.layers:
+        layer.tokens_seen = prefill
+        for conv in layer.conv_caches:
+            conv.initialized = True
+    cache.prepare_decode()
+    for step in range(prefill, states.shape[1]):
+        output = actual(states[:, step : step + 1].cuda(), cache).cpu()
+        assert_fp32_close(output, expected[:, step : step + 1])
+        cache.position.add_(1)
 
 
 @torch.no_grad()

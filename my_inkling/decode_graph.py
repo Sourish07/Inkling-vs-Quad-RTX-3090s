@@ -6,14 +6,14 @@ import torch.distributed as dist
 
 class DecodeGraph:
     @torch.inference_mode()
-    def __init__(self, model, cache, next_token, capacity, capture=True):
+    def __init__(self, model, cache, next_token, capture=True):
         assert next_token.is_cuda
         assert not model.training
         self.model = model
         self.cache = cache
         self.token = next_token.clone()
-        self.remaining = capacity - cache.layers[0].tokens_seen
-        cache.prepare_decode(capacity)
+        self.remaining = cache.capacity - cache.layers[0].tokens_seen
+        cache.prepare_decode()
         buffers = [self.token, *cache.decode_buffers()]
         saved = [buffer.clone() for buffer in buffers]
 

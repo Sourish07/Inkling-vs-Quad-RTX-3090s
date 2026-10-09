@@ -115,7 +115,8 @@ def main(
     # Step 0 is prefill (+ first token); the decode clock starts after it.
     decode_start = 0.0
     num_decode_tokens = 0
-    cache = MyInklingCache(config.text_config, batch_size=batch_size, pad_counts=pad_count)
+    capacity = num_tokens + max_new_tokens - 1
+    cache = MyInklingCache(config.text_config, batch_size, capacity, pad_count)
     decode_graph = None
 
     profiler = Profiler(enable=profile)
@@ -155,7 +156,6 @@ def main(
                         model,
                         cache,
                         next_input,
-                        capacity=num_tokens + max_new_tokens - 1,
                         capture=cuda_graph,
                     )
                     decode_start = time.perf_counter()
