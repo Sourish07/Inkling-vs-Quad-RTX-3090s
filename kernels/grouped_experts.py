@@ -27,7 +27,6 @@ def _gemm(
     BM: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
-    fused_gate_up: tl.constexpr,
 ):
     """
     Compute one projection for one tile of one active expert's routed rows.
@@ -114,7 +113,7 @@ def _gemm(
 
             acc += tl.dot(a, b)
 
-        if fused_gate_up:
+        if PROJECTION == 0:
             # acc: (BM, BN)
             # output matrix: (self.capacity, self.intermediate_dim)
             gate, up = tl.split(tl.reshape(acc, (BM, BN // 2, 2)))  # See DEVLOG.md
@@ -283,7 +282,6 @@ class GroupedExperts:
                 block_m,
                 block_n,
                 block_k,
-                projection == 0,
             )
 
         _reduce[(x.shape[0], triton.cdiv(self.hidden_dim, 256))](
