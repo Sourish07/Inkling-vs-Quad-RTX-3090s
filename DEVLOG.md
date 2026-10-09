@@ -156,3 +156,18 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 - The PCIe hop depends on driver-level p2p (which I have a patched driver for installed)
 - Need to use PyTorch's symmetric memory for potential speed ups
 - Running at 18.14 tok/s
+
+## Adding batching support (Not an optimization)
+
+- Reasoning about attention masks is complicated
+- I just hardcoded some assumptions for now:
+  - Prefill only runs once, i.e. no multi turn requests (yet)
+  - Prefill length has to be less than or equal to 512 tokens
+    - Otherwise, the sliding window attention mask logic needs extra logic
+- Need to vectorize the masking creation logic
+- Added some random asserts that need to be cleaned up
+- Cross product of {prefill, decode} and {sliding window, full attn} results in four regimes that need to be handled separately
+- I'm currently using `cache.position` to indicate if decode is running (I don't like that)
+- I think I just hardcoded that cache will always be present
+- cursed asf
+- 

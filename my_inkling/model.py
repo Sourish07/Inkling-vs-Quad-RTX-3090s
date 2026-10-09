@@ -541,16 +541,20 @@ class MyInklingAttention(nn.Module):
         if static_decode:
             # in this branch s = 1 (i.e number of queries)
             distance: Int[T, "1 k_len"] = cache.decode_distance(self.layer_idx)
-            position_bias: Fp[T, "bs h 1 k_len"] = self.rel_logits_proj(relative_states, distance)
+            position_bias: Fp[T, "bs h 1 k_len"] = self.rel_logits_proj(
+                relative_states, distance
+            )
             # cache.position: int single value
             # cache.pad_counts: bs
             assert cache.pad_counts is not None
-            # sdpa_mask is 4 dimensional so in order for pad_counts to broadcast correctly, 
+            # sdpa_mask is 4 dimensional so in order for pad_counts to broadcast correctly,
             # we need the "bs" dimensions to align, which is why we add three extra dimensions to the right
             # sdpa_mask: (bs, h, 1, k_len) & pad_counts: (bs, 1, 1, 1)
             pad_counts = cache.pad_counts.view(-1, 1, 1, 1)
             allowed = (distance >= 0) & (distance <= cache.position - pad_counts)
-            sdpa_mask: Fp[T, "bs h 1 k_len"] = position_bias.masked_fill(~allowed, float("-inf"))
+            sdpa_mask: Fp[T, "bs h 1 k_len"] = position_bias.masked_fill(
+                ~allowed, float("-inf")
+            )
             # sdpa_mask: Fp[T, "bs h 1 k_len"]
         else:
             # Relative distances do not depend on the absolute cache position.
@@ -701,7 +705,7 @@ class MyInklingTextTower(nn.Module):
         if cache is not None and cache.position is None:
             # only run for prefill
             for b in range(hidden_states.shape[0]):
-                hidden_states[b, :cache.pad_counts[b]] = 0
+                hidden_states[b, : cache.pad_counts[b]] = 0
 
         for layer in self.layers:
             hidden_states = layer(hidden_states, cache=cache)
