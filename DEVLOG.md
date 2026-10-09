@@ -172,7 +172,6 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
     - Otherwise, the sliding window attention mask logic needs extra logic
 - Added some random asserts that need to be cleaned up
 - Cross product of {prefill, decode} and {sliding window, full attn} results in four regimes that need to be handled separately
-- I'm currently using `cache.position` to indicate if decode is running (I don't like that)
 - Cleaned up `cache.py`
   - First, just allocated full kv cache for max seq len at init (will add paging later)
     - Fine for shorter sequences

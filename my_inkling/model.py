@@ -403,9 +403,7 @@ class MyInklingShortConv(nn.Module):
         cache: MyInklingCache | None = None,
         residual: Fp[T, "bs s d"] | None = None,
     ) -> Fp[T, "bs s d"]:
-        if cache is not None and cache.has_previous_state(
-            self.layer_idx, self.conv_idx
-        ):
+        if cache is not None and cache.tokens_seen > 0:
             # Decode: the kernel shifts the cached history in place.
             history = cache.layers[self.layer_idx].conv_caches[self.conv_idx].cache
             return short_conv(hidden_states, self.conv1d.weight, history, residual)
@@ -526,10 +524,10 @@ class MyInklingAttention(nn.Module):
         )
 
         query_start = 0
-        static_decode = cache is not None and cache.position is not None
+        static_decode = cache is not None and cache.decoding
 
         if cache is not None:
-            query_start = cache.layers[self.layer_idx].tokens_seen
+            query_start = cache.tokens_seen
             key_states, value_states = cache.update_attn_cache(
                 key_states, value_states, self.layer_idx
             )
@@ -701,7 +699,7 @@ class MyInklingTextTower(nn.Module):
     ) -> Fp[T, "bs s d"]:
         hidden_states: Fp[T, "bs s d"] = self.embed_tokens(input_ids)
 
-        if cache is not None and cache.position is None:
+        if cache is not None and not cache.decoding:
             # only run for prefill
             assert cache.pad_counts is not None
             # cache.pad_counts: Fp[T, " bs"]
@@ -771,6 +769,6 @@ class MyInkling(nn.Module):
             if unpadded_vocab_size is not None
             else padded_logits
         )
-        if cache is not None and cache.position is not None:
-            cache.position.add_(1)
+        if cache is not None:
+            cache.advance(input_ids.shape[1])
         return logits

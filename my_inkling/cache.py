@@ -40,8 +40,6 @@ class ShortConvLayerCache:
         is_swa: bool = True,
         batch_size: int = 16,
     ):
-        self.initialized = False
-
         self.is_kv_sconv = is_kv_sconv
         self.is_swa = is_swa
         self.batch_size = batch_size
@@ -72,8 +70,6 @@ class ShortConvLayerCache:
         self.cache = torch.roll(self.cache, -roll_size, dims=-1)
         self.cache[..., -roll_size:].copy_(tokens[:, :, -roll_size:])
 
-        self.initialized = True
-
         return self.cache
 
 
@@ -101,23 +97,24 @@ class FullAttentionLayerCache:
             shape, dtype=dtype, device=device
         )
         self.v_cache: Fp[T, "bs hk capacity c"] = torch.zeros_like(self.k_cache)
-        self.tokens_seen = 0
         self.key_positions: T | None = None
 
     def update_cache(
         self,
         key_states: Fp[T, "bs hk s c"],
         value_states: Fp[T, "bs hk s c"],
+        start: int,
     ) -> tuple[Fp[T, "bs hk k_len c"], Fp[T, "bs hk k_len c"]]:
-        old_size = self.tokens_seen
-        new_size = old_size + key_states.shape[2]
+        """
+        Write the new keys at slot `start`; return every key written so far.
+        """
+        end = start + key_states.shape[2]
         # A sliding layer rolls over only in decode, where a mask selects its keys.
-        assert new_size <= self.k_cache.shape[2], "K/V cache capacity exhausted"
+        assert end <= self.k_cache.shape[2], "K/V cache capacity exhausted"
 
-        update_kv(key_states, value_states, self.k_cache, self.v_cache, old_size)
+        update_kv(key_states, value_states, self.k_cache, self.v_cache, start)
 
-        self.tokens_seen = new_size
-        return self.k_cache[:, :, :new_size], self.v_cache[:, :, :new_size]
+        return self.k_cache[:, :, :end], self.v_cache[:, :, :end]
 
 
 class SlidingWindowAttentionLayerCache(FullAttentionLayerCache):
@@ -154,7 +151,6 @@ class SlidingWindowAttentionLayerCache(FullAttentionLayerCache):
             shape, dtype=dtype, device=device
         )
         self.v_cache: Fp[T, "bs hk capacity c"] = torch.zeros_like(self.k_cache)
-        self.tokens_seen = 0
         self.key_positions: T | None = None
 
 
@@ -183,7 +179,18 @@ class MyInklingCache:
             layer_classes[layer_type](config, batch_size, capacity, dtype, device)
             for layer_type in config.layer_types
         ]
-        self.position = None
+        # Tokens stored by every layer. Prefill counts on the host in `tokens_seen`;
+        # decode counts on the GPU in `position`, where a CUDA graph can advance it.
+        self.tokens_seen = 0
+        self.position: Int[T, ""] = torch.zeros((), dtype=torch.int64, device=device)
+        self.decoding = False
+
+    def advance(self, num_tokens: int) -> None:
+        """Count the tokens of one forward, after every layer has stored them."""
+        if self.decoding:
+            self.position.add_(num_tokens)
+        else:
+            self.tokens_seen += num_tokens
 
     def prepare_decode(self) -> None:
         """
@@ -191,22 +198,17 @@ class MyInklingCache:
 
         Sliding keys retain their physical ring order; attention masks use GPU
         distances instead of moving keys or changing tensor shapes each token.
-        `position` becomes the live token counter; per-layer Python sizes freeze.
+        `position` becomes the live token counter; `tokens_seen` freezes.
         """
-        assert self.position is None
-        seen = self.layers[0].tokens_seen
-        assert 0 < seen < self.capacity
+        assert not self.decoding
+        assert 0 < self.tokens_seen < self.capacity
 
         for layer in self.layers:
-            assert layer.tokens_seen == seen
-            assert all(conv.initialized for conv in layer.conv_caches)
-
             device = layer.k_cache.device
             layer.key_positions = torch.arange(layer.k_cache.shape[2], device=device)
 
-        self.position: Int[T, " 1"] = torch.tensor(
-            seen, dtype=torch.int64, device=device
-        )
+        self.position.fill_(self.tokens_seen)
+        self.decoding = True
 
     def decode_distance(self, layer_idx: int) -> T:
         """
@@ -217,7 +219,7 @@ class MyInklingCache:
         some positions are going to be negative (i.e. if we're generating token 56, kv buffer is still 512 long)
         """
         layer = self.layers[layer_idx]
-        assert self.position is not None and layer.key_positions is not None
+        assert self.decoding
         # self.position is the number of tokens seen so far
         # layer.key_positions is the arange of the entire sequence length
         distance = self.position - layer.key_positions
@@ -243,9 +245,9 @@ class MyInklingCache:
         value_states: Fp[T, "bs hk s c"],
         layer_idx: int,
     ) -> tuple[Fp[T, "bs hk k_len c"], Fp[T, "bs hk k_len c"]]:
-        if self.position is not None:
+        layer = self.layers[layer_idx]
+        if self.decoding:
             assert key_states.shape[2] == 1
-            layer = self.layers[layer_idx]
             window = getattr(layer, "sliding_window_size", 0)
             update_kv(
                 key_states,
@@ -256,7 +258,7 @@ class MyInklingCache:
                 window,
             )
             return layer.k_cache, layer.v_cache
-        return self.layers[layer_idx].update_cache(key_states, value_states)
+        return layer.update_cache(key_states, value_states, self.tokens_seen)
 
     def update_conv_cache(
         self,
@@ -265,7 +267,3 @@ class MyInklingCache:
         conv_idx: int,
     ) -> Fp[T, "bs d conv_kernel_size"]:
         return self.layers[layer_idx].conv_caches[conv_idx].update_cache(hidden_states)
-
-    def has_previous_state(self, layer_idx: int, conv_idx: int) -> bool:
-        conv_cache = self.layers[layer_idx].conv_caches[conv_idx]
-        return conv_cache.initialized

@@ -12,7 +12,7 @@ class DecodeGraph:
         self.model = model
         self.cache = cache
         self.token = next_token.clone()
-        self.remaining = cache.capacity - cache.layers[0].tokens_seen
+        self.remaining = cache.capacity - cache.tokens_seen
         cache.prepare_decode()
         buffers = [self.token, *cache.decode_buffers()]
         saved = [buffer.clone() for buffer in buffers]

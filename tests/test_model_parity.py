@@ -313,16 +313,12 @@ def test_attention_cached_fp32(layer_idx: int, text_config: InklingTextConfig) -
     prefill = 2
     output = actual(states[:, :prefill].cuda(), cache).cpu()
     assert_fp32_close(output, expected[:, :prefill])
-    # Only this layer's K/V convolutions ran; mark the rest so the cache can freeze.
-    for layer in cache.layers:
-        layer.tokens_seen = prefill
-        for conv in layer.conv_caches:
-            conv.initialized = True
+    cache.advance(prefill)  # MyInkling.forward does this after the last layer.
     cache.prepare_decode()
     for step in range(prefill, states.shape[1]):
         output = actual(states[:, step : step + 1].cuda(), cache).cpu()
         assert_fp32_close(output, expected[:, step : step + 1])
-        cache.position.add_(1)
+        cache.advance(1)
 
 
 @torch.no_grad()
