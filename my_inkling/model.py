@@ -539,10 +539,19 @@ class MyInklingAttention(nn.Module):
 
         kv_len = key_states.shape[2]
         if static_decode:
-            distance = cache.decode_distance(self.layer_idx)
-            position_bias = self.rel_logits_proj(relative_states, distance)
-            allowed = (distance >= 0) & (distance <= cache.position - cache.pad_counts)
-            sdpa_mask = position_bias.masked_fill(~allowed, float("-inf"))
+            # in this branch s = 1 (i.e number of queries)
+            distance: Int[T, "1 k_len"] = cache.decode_distance(self.layer_idx)
+            position_bias: Fp[T, "bs h 1 k_len"] = self.rel_logits_proj(relative_states, distance)
+            # cache.position: int single value
+            # cache.pad_counts: bs
+            assert cache.pad_counts is not None
+            # sdpa_mask is 4 dimensional so in order for pad_counts to broadcast correctly, 
+            # we need the "bs" dimensions to align, which is why we add three extra dimensions to the right
+            # sdpa_mask: (bs, h, 1, k_len) & pad_counts: (bs, 1, 1, 1)
+            pad_counts = cache.pad_counts.view(-1, 1, 1, 1)
+            allowed = (distance >= 0) & (distance <= cache.position - pad_counts)
+            sdpa_mask: Fp[T, "bs h 1 k_len"] = position_bias.masked_fill(~allowed, float("-inf"))
+            # sdpa_mask: Fp[T, "bs h 1 k_len"]
         else:
             # Relative distances do not depend on the absolute cache position.
             distance: Int[T, "s k_len"] = (
@@ -556,6 +565,17 @@ class MyInklingAttention(nn.Module):
             if self.sliding_window is not None:
                 allowed &= distance < self.sliding_window
             sdpa_mask = position_bias.masked_fill(~allowed, float("-inf"))
+            # sdpa_mask: Fp[T, "bs h s k_len"]
+            # For now, assume s < 512
+            assert sdpa_mask.shape[2] <= 512  # TODO: we'll deal with this later
+            # TODO: vectorize this part
+            if cache is not None:
+                for b in range(sdpa_mask.shape[0]):
+                    sdpa_mask[b, :, :, : cache.pad_counts[b]] = float("-inf")
+                    # This is not needed because the causal mask already covers it
+                    # sdpa_mask[b, :, : cache.pad_counts[b], :] = float("-inf")
+
+        # allowed: Bool[T, "s k_len"]
 
         # Inkling scales both content scores and relative bias in full attention.
         if (
@@ -675,8 +695,14 @@ class MyInklingTextTower(nn.Module):
     def forward(
         self, input_ids: Int[T, "bs s"], cache: MyInklingCache | None = None
     ) -> Fp[T, "bs s d"]:
-        """Process unpadded tokens with an optional request-scoped cache."""
         hidden_states = self.embed_tokens(input_ids)
+
+        # TODO: vectorize this part
+        if cache is not None and cache.position is None:
+            # only run for prefill
+            for b in range(hidden_states.shape[0]):
+                hidden_states[b, :cache.pad_counts[b]] = 0
+
         for layer in self.layers:
             hidden_states = layer(hidden_states, cache=cache)
         return self.norm(hidden_states)
