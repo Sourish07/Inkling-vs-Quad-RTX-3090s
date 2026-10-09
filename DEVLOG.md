@@ -136,6 +136,11 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
     - Also adds residual for the attn-output & mlp-output
   - Paired K/V cache writes, which for sliding window, writes the tokens twice
     - Uses a mirrored ring buffer; cost is double storage
+    - Example (each row has a slide where tokens are in order):
+      - [1, 2, 3, 1, 2, 3]
+      - [4, 2, 3, 4, 2, 3]
+      - [4, 5, 3, 4, 5, 3]
+      - [4, 5, 6, 4, 5, 6]
     - Replaced `torch.roll`, which would create new allocation each time
 - Running at ~14.77 tok/s!
 
