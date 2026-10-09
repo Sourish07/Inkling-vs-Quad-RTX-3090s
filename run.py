@@ -65,9 +65,7 @@ def main(
 
     logger.info("Loading state dict into sharded model")
     with Timer("Non-expert checkpoint loading"):
-        non_expert_state_dict = load_non_expert_state_dict(
-            model, local_hf_path, device_mesh
-        )
+        non_expert_state_dict = load_non_expert_state_dict(local_rank, device)
     missing, unexpected = model.load_state_dict(
         non_expert_state_dict, strict=False, assign=True
     )
@@ -77,7 +75,7 @@ def main(
 
     with Timer("Expert checkpoint loading"):
         expert_state_dict = load_expert_state_dict(
-            model, local_hf_path, device_mesh, gpu_experts_per_rank
+            local_rank, device, gpu_experts_per_rank
         )
     apply_ep_plan(model, device_mesh, expert_state_dict, num_slots=10)
 

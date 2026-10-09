@@ -2,8 +2,6 @@ from .checkpointing import (
     convert_checkpoint_shapes,
     convert_checkpoint_tensors,
     load_config,
-    load_expert_state_dict,
-    load_non_expert_state_dict,
 )
 from .dist import (
     get_device_mesh,
@@ -11,6 +9,7 @@ from .dist import (
     setup_ddp_local,
     setup_rank_aware_logger,
 )
+from .flashpack_cache import load_expert_state_dict, load_non_expert_state_dict
 from .profiling import Profiler, Timer
 
 __all__ = [

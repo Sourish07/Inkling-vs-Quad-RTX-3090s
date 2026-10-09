@@ -1,25 +1,12 @@
-"""Convert and load Inkling checkpoint tensors."""
+"""Convert Inkling checkpoint tensors."""
 
 import json
 from pathlib import Path
 
 import torch
-import torch.distributed as dist
-from loguru import logger
-from safetensors import safe_open
-from torch.distributed.device_mesh import DeviceMesh
 from transformers import AutoConfig
 from transformers.conversion_mapping import get_checkpoint_conversion_mapping
 from transformers.core_model_loading import WeightConverter, WeightRenaming
-
-from utils.flashpack_cache import (
-    cache_directory,
-    cache_ready,
-    load_experts,
-    load_pack,
-    save_experts,
-    save_pack,
-)
 
 
 def convert_checkpoint_tensors(
@@ -84,139 +71,3 @@ def load_config(checkpoint_dir: str | Path):
     if "dense_intermediate_size" in text:
         config.text_config.moe_intermediate_size = text["intermediate_size"]
     return config
-
-
-def _llm_tensors(checkpoint_dir: str | Path, device: str, *, experts: bool):
-    """Yield ``(handle, key)`` for the routed-expert or the remaining LLM tensors."""
-    for file in sorted(Path(checkpoint_dir).glob("*.safetensors")):
-        if file.name == "mtp.safetensors":
-            continue
-        with safe_open(file, framework="pt", device=device) as handle:
-            for key in sorted(handle.keys()):
-                if (
-                    key.startswith("model.llm.")
-                    and (".mlp.experts." in key) == experts
-                    and not key.endswith((".original_shape", ".input_amax"))
-                ):
-                    yield handle, key
-
-
-def load_non_expert_state_dict(
-    model: torch.nn.Module, checkpoint_dir: str | Path, device_mesh: DeviceMesh
-) -> dict[str, torch.Tensor]:
-    """
-    Load a cached rank-local pack, or scatter/broadcast from rank 0 and cache.
-    """
-    rank = device_mesh.get_local_rank()
-    group = device_mesh.get_group()
-    device = (
-        torch.device("cuda", torch.cuda.current_device())
-        if device_mesh.device_type == "cuda"
-        else torch.device(device_mesh.device_type)
-    )
-    cache = cache_directory(model, checkpoint_dir, device_mesh)
-    if cache_ready(cache, device_mesh, device):
-        logger.info("Loading rank {} non-experts from FlashPack cache {}", rank, cache)
-        return load_pack(cache / f"rank-{rank}.flashpack", device)
-    templates = model.state_dict()
-    state = {}
-    for handle, key in _llm_tensors(checkpoint_dir, str(device), experts=False):
-        # All ranks read headers; only rank 0 reads the actual weight.
-        names = convert_checkpoint_tensors(
-            {key: torch.empty(handle.get_slice(key).get_shape(), device="meta")}
-        )
-        names = [name for name in names if name in templates]
-        if not names:
-            continue
-        converted = (
-            convert_checkpoint_tensors({key: handle.get_tensor(key)})
-            if rank == 0
-            else {}
-        )
-        for name in names:
-            target = templates[name]
-            module_name, _, parameter_name = name.rpartition(".")
-            module = model.get_submodule(module_name)
-            shard_dim = getattr(module, "_tp_shard_dims", {}).get(parameter_name)
-            if rank == 0:
-                full = converted[name].to(dtype=target.dtype).contiguous()
-            if shard_dim is None:
-                value = full if rank == 0 else torch.empty_like(target, device=device)
-                dist.broadcast(value, src=0, group=group)
-            else:
-                value = torch.empty_like(target, device=device)
-                shards = (
-                    [
-                        chunk.contiguous()
-                        for chunk in full.chunk(device_mesh.size(), dim=shard_dim)
-                    ]
-                    if rank == 0
-                    else None
-                )
-                dist.scatter(value, scatter_list=shards, src=0, group=group)
-                del shards
-            state[name] = value
-            if rank == 0:
-                del full
-        del converted
-    if cache is not None:
-        save_pack(state, cache / f"rank-{rank}.flashpack")
-    return state
-
-
-def load_expert_state_dict(
-    model: torch.nn.Module,
-    checkpoint_dir: str | Path,
-    device_mesh: DeviceMesh,
-    gpu_experts_per_rank: int,
-) -> dict[str, dict[int, torch.Tensor]]:
-    """Load this rank's contiguous expert shard with per-expert CPU/GPU storage.
-
-    The first ``gpu_experts_per_rank`` experts of each bank's shard go to this
-    rank's GPU; the rest stay in pinned CPU memory. Every rank reads only its
-    shard from disk.
-
-    Returns ``{weight_name: {global_expert_id: tensor}}``. Mixed-device banks
-    cannot be loaded directly with ``model.load_state_dict``. NVFP4 weights
-    remain packed, with their ``_scale`` and ``_scale2`` tensors preserved.
-    Layers stored unquantized have no scale banks. Either way, gate/up rows
-    stay interleaved as in the checkpoint.
-
-    Complete FlashPack caches bypass conversion and sharding. Cache misses use
-    the original flow above, then save GPU packs and a shared CPU-expert pack.
-    """
-    rank = device_mesh.get_local_rank()
-    device = torch.device("cuda", torch.cuda.current_device())
-    cache = cache_directory(
-        model,
-        checkpoint_dir,
-        device_mesh,
-        experts=True,
-        gpu_experts=gpu_experts_per_rank,
-    )
-    if cache_ready(cache, device_mesh, device, experts=True):
-        return load_experts(cache, device_mesh, device)
-    templates = model.state_dict()
-    state = {}
-    for handle, key in _llm_tensors(checkpoint_dir, "cpu", experts=True):
-        tensor_slice = handle.get_slice(key)
-        packed = tensor_slice.get_dtype() == "U8" or key.endswith((".scale", ".scale2"))
-        num_experts = tensor_slice.get_shape()[0]
-        shard_size = -(-num_experts // device_mesh.size())
-        start = min(rank * shard_size, num_experts)
-        converted = convert_checkpoint_tensors(
-            {key: tensor_slice[start : start + shard_size]}, packed_experts=True
-        )
-        for name, bank in converted.items():
-            if not packed:
-                bank = bank.to(dtype=templates[name].dtype)
-            state[name] = {
-                start + local_id: weight.contiguous().to(device)
-                if local_id < gpu_experts_per_rank
-                else weight.contiguous().pin_memory()
-                for local_id, weight in enumerate(bank)
-            }
-        del converted
-    if cache is not None:
-        save_experts(state, cache, device_mesh)
-    return state

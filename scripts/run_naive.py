@@ -231,7 +231,7 @@ def load_weights(
             if ".mlp.experts." not in name
         }
         if skip_checkpoint_loading
-        else load_non_expert_state_dict(model, path, mesh)
+        else load_non_expert_state_dict(rank, device)
     )
     if skip_checkpoint_loading:
         for name, tensor in state.items():
