@@ -168,9 +168,19 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 - Cross product of {prefill, decode} and {sliding window, full attn} results in four regimes that need to be handled separately
 - I'm currently using `cache.position` to indicate if decode is running (I don't like that)
 - I think I just hardcoded that cache will always be present
-- cursed asf
-- I think `cache.py` could probably be cleaned up as well
-  - Yeah it's horribly designed rip
+- Cleaned up `cache.py`
+  - First, just allocated full kv cache for max seq len at init (will add paging later)
+    - Fine for shorter sequences
+  - Second, removed mirrored buffer
+    - It was originally used as replacement for `torch.roll`
+    - Simple way to always have a single slice return all the keys in order
+      - Easy to calculate distance offsets from
+    - Cuda graphs requires static memory addresses so we couldn't just "slice" the mirrored buffer anymore
+      - Should've just removed the mirrored buffer then...
+      - `(position - slot) % window` is used now (in `decode_distance`). tokens don't have to remain in order
+        - `position` index of the current otken in the sequence (`cache.position`)
+        - `slot` index of the place in the kv buffer, (between 0 & 511 for sliding window layers)
+        - `window` is 512 for sliding window layers
 - Updated kernels to support bs > 1
   - bs is now the first dim in the launch grid
   - requires adding offsets to input tensors
