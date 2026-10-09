@@ -196,3 +196,6 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
     - The 2 remains in the last dim because we want to keep the gate/up pairs together
     - If we did `.rehape((2, BN // 2))` we would get:
       - `[[g0, u0, g1, u1], [g2, u2, g3, u3]]` | (shape: `(2, BN // 2)`)
+- Also, changed number of pinned GPU experts from 24 to 20 to accomodate bs=16. (bs=1 is now slower...)
+  - Will add dynamic configuration soon
+  - Running at 17.22 tok/s
