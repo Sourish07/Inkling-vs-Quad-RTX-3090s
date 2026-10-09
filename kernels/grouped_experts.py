@@ -115,15 +115,12 @@ def _gemm(
             acc += tl.dot(a, b)
 
         if fused_gate_up:
-            # acc is (BM, BN)
-            # output matrix is (self.capacity, self.intermediate_dim)
+            # acc: (BM, BN)
+            # output matrix: (self.capacity, self.intermediate_dim)
+            gate, up = tl.split(tl.reshape(acc, (BM, BN // 2, 2)))  # See DEVLOG.md
+            activated = gate * tl.sigmoid(gate)  # Swiglu
 
-            # TODO: Make sure I can reason about why the 2 goes in last dim...
-            gate, up = tl.split(tl.reshape(acc, (BM, BN // 2, 2)))
-
-            activated = gate * tl.sigmoid(gate)
-
-            # Each output tile is now BN // 2 elements wide
+            # Each output tile is now BN // 2 elements wide (BM, BN // 2)
             _cols = column_tile_number * (BN // 2) + tl.arange(0, BN // 2)
             tl.store(
                 Y + route[:, None] * (N // 2) + _cols[None, :],
@@ -289,14 +286,7 @@ class GroupedExperts:
                 block_k,
                 projection == 0,
             )
-            # TODO: I can probably fuse
-            if projection == 0 and False:
-                projected = self.gate_up[:routes]
-                torch.mul(
-                    self.act_fn(projected[:, 0::2]),
-                    projected[:, 1::2],
-                    out=self.activated[:routes],
-                )
+
         _reduce[(x.shape[0], triton.cdiv(self.hidden_dim, 256))](
             self.down,
             indices,
