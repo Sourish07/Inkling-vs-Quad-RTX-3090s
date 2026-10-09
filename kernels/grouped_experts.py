@@ -120,19 +120,21 @@ def _gemm(
             gate, up = tl.split(tl.reshape(acc, (BM, BN // 2, 2)))  # See DEVLOG.md
             activated = gate * tl.sigmoid(gate)  # Swiglu
 
-            # Each output tile is now BN // 2 elements wide (BM, BN // 2)
+            # Output tile: (BM, BN // 2)
             _cols = column_tile_number * (BN // 2) + tl.arange(0, BN // 2)
-            tl.store(
-                Y + route[:, None] * (N // 2) + _cols[None, :],
-                (activated * up).to(dtype),
-                (row[:, None] < count) & (_cols[None, :] < (N // 2)),
-            )
+            _N = N // 2
+            output = (activated * up).to(dtype)
         else:
-            tl.store(
-                Y + route[:, None] * N + cols[None, :],
-                acc.to(dtype),
-                (row[:, None] < count) & (cols[None, :] < N),
-            )
+            # Output tile: (BM, BN)
+            _cols = cols
+            _N = N
+            output = acc.to(dtype)
+
+        tl.store(
+            Y + route[:, None] * _N + _cols[None, :],
+            output,
+            (row[:, None] < count) & (_cols[None, :] < _N),
+        )
 
 
 @triton.jit
