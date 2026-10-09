@@ -7,7 +7,6 @@ from jaxtyping import Int
 from torch import Tensor as T
 from torch import nn
 from torch.nn import functional as F
-from transformers import InklingForConditionalGeneration
 
 from kernels.decode import rms_norm, short_conv
 
@@ -515,12 +514,12 @@ class MyInklingAttention(nn.Module):
         query_states = self.q_norm(
             q.view(bs, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         )
-        key_states: Fp[T, "bs hk k_len c"] = self.k_norm(
+        key_states: Fp[T, "bs hk s c"] = self.k_norm(
             self.k_sconv(k, cache=cache)  #  Fp[T, "bs s hk_c"]
             .view(bs, q_len, self.num_key_value_heads, self.head_dim)
             .transpose(1, 2)
         )
-        value_states: Fp[T, "bs hk k_len c"] = (
+        value_states: Fp[T, "bs hk s c"] = (
             self.v_sconv(v, cache=cache)  # Fp[T, "bs s hk_c"]
             .view(bs, q_len, self.num_key_value_heads, self.head_dim)
             .transpose(1, 2)
@@ -534,6 +533,7 @@ class MyInklingAttention(nn.Module):
             key_states, value_states = cache.update_attn_cache(
                 key_states, value_states, self.layer_idx
             )
+        # key_states, value_states: Fp[T, "bs hk k_len c"] (k_len = s without a cache)
 
         relative_states: Fp[T, "bs s h r"] = r.view(bs, q_len, self.num_heads, -1)
 

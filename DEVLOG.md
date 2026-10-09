@@ -4,6 +4,7 @@
 
 - Literally my first goal is to get just something running; `transformers` sample code won't work because the model is too large to fit across GPUs or even just within host memory.
 - Used agents to create testing suite to ensure parity with transformers implementation
+  - `from transformers import InklingForConditionalGeneration` to jump to reference quickly
 - Architecture broadly makes sense. Using jaxtyping & einops makes tensors ops way more readable
 - For now, omitting caching & vision/audio towers
 - Relative positonal encodings is new to me
@@ -172,7 +173,6 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 - Added some random asserts that need to be cleaned up
 - Cross product of {prefill, decode} and {sliding window, full attn} results in four regimes that need to be handled separately
 - I'm currently using `cache.position` to indicate if decode is running (I don't like that)
-- I think I just hardcoded that cache will always be present
 - Cleaned up `cache.py`
   - First, just allocated full kv cache for max seq len at init (will add paging later)
     - Fine for shorter sequences
@@ -182,10 +182,9 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
       - Easy to calculate distance offsets from
     - Cuda graphs requires static memory addresses so we couldn't just "slice" the mirrored buffer anymore
       - Should've just removed the mirrored buffer then...
-      - `(position - slot) % window` is used now (in `decode_distance`). tokens don't have to remain in order
-        - `position` index of the current otken in the sequence (`cache.position`)
-        - `slot` index of the place in the kv buffer, (between 0 & 511 for sliding window layers)
-        - `window` is 512 for sliding window layers
+      - For decode in full attn layers, the size of the kv buffer is the final sequence length (i.e. `capacity`)
+        - Kinda ineffecient, but we can optimize when we add paging
+      - Simplified `decode_distance` (see fn's docstring)
 - Updated kernels to support bs > 1
   - bs is now the first dim in the launch grid
   - requires adding offsets to input tensors

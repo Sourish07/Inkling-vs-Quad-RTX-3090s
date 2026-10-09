@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from jaxtyping import Float as Fp
+from jaxtyping import Int
 from torch import Tensor as T
 
 from kernels.decode import update_kv
@@ -203,11 +204,22 @@ class MyInklingCache:
             device = layer.k_cache.device
             layer.key_positions = torch.arange(layer.k_cache.shape[2], device=device)
 
-        self.position = torch.tensor(seen, dtype=torch.int64, device=device)
+        self.position: Int[T, " 1"] = torch.tensor(
+            seen, dtype=torch.int64, device=device
+        )
 
     def decode_distance(self, layer_idx: int) -> T:
+        """
+        Returns the relative distance between the current position and
+        each key position in the layer's kv cache.
+
+        For full attention layers, since we've allocated the entire kv buffer already,
+        some positions are going to be negative (i.e. if we're generating token 56, kv buffer is still 512 long)
+        """
         layer = self.layers[layer_idx]
         assert self.position is not None and layer.key_positions is not None
+        # self.position is the number of tokens seen so far
+        # layer.key_positions is the arange of the entire sequence length
         distance = self.position - layer.key_positions
         if isinstance(layer, SlidingWindowAttentionLayerCache):
             distance = distance.remainder(layer.sliding_window_size)
