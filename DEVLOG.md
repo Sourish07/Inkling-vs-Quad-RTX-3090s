@@ -171,3 +171,15 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 - cursed asf
 - I think `cache.py` could probably be cleaned up as well
   - Yeah it's horribly designed rip
+- Updated kernels to support bs > 1
+  - bs is now the first dim in the launch grid
+  - requires adding offsets to input tensors
+- Also fused the swiglu(gate) * up operation into the GEMM
+  - The output tile for the first GEMM has half the number of columns now
+  - `gate, up = tl.split(tl.reshape(acc, (BM, BN // 2, 2)))`
+  - `acc` is `BM * BN` with the gate & up being interleaved along columns
+    - As an example, take one row -> `[g0, u0, g1, u1, g2, u2, g3, u3]` | (shape: `(BN,)`)
+    - Goal is -> `[[g0, u0], [g1, u1], [g2, u2], [g3, u3]]` | (shape: `(BN // 2, 2)`)
+    - The 2 remains in the last dim because we want to keep the gate/up pairs together
+    - If we did `.rehape((2, BN // 2))` we would get:
+      - `[[g0, u0, g1, u1], [g2, u2, g3, u3]]` | (shape: `(2, BN // 2)`)
