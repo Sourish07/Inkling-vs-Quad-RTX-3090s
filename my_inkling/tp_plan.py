@@ -11,7 +11,7 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.nn import functional as F
 
-from kernels.paired_all_reduce import all_reduce
+from kernels.paired_all_reduce_triton import all_reduce
 
 from .model import (
     InklingConfig,
