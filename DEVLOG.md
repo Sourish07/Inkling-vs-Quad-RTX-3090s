@@ -171,3 +171,4 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 - I think I just hardcoded that cache will always be present
 - cursed asf
 - I think `cache.py` could probably be cleaned up as well
+  - Yeah it's horribly designed rip
