@@ -233,9 +233,6 @@ class GroupedExperts:
             (len(self.experts), self.capacity), dtype=torch.int32, device=self.device
         )
         options = {"dtype": self.dtype, "device": self.device}
-        # self.gate_up = torch.empty(
-        #     (self.capacity, 2 * self.intermediate_dim), **options
-        # )
         self.activated = torch.empty((self.capacity, self.intermediate_dim), **options)
         self.down = torch.empty((self.capacity, self.hidden_dim), **options)
 
