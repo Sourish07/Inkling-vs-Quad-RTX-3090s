@@ -35,12 +35,13 @@ def _gemm(
     NVFP4 inline. This lets one launch cover all active experts, wherever their
     weights are, with no launch per expert and no dequantized copy of the weights.
     """
-    group = tl.program_id(1)
-    tile = tl.program_id(0)
-    row = tile // tl.cdiv(N, BN) * BM + tl.arange(0, BM)
+    row_tile_number = tl.program_id(0)
+    column_tile_number = tl.program_id(1)
+    group = tl.program_id(2)
+    row = row_tile_number * BM + tl.arange(0, BM)
     count = tl.load(Counts + group)
 
-    if tile // tl.cdiv(N, BN) * BM < count:
+    if row_tile_number * BM < count:
         expert = tl.load(Experts + group)
         pointer_stride = 6 if QUANTIZED else 2
         projection_stride = 3 if QUANTIZED else 1
@@ -55,7 +56,6 @@ def _gemm(
 
         route = tl.load(Rows + group * CAPACITY + row, row < count, 0)
         input_row = route // TOP_K if PROJECTION == 0 else route
-        column_tile_number = tile % tl.cdiv(N, BN)
         cols = column_tile_number * BN + tl.arange(0, BN)
         ks = tl.arange(0, BK)
         acc = tl.zeros((BM, BN), tl.float32)
@@ -261,12 +261,12 @@ class GroupedExperts:
             (1, self.activated, self.down, self.hidden_dim, self.intermediate_dim),
         ):
             # The GPU planner compacts active groups; unused groups have count zero.
-            _gemm[
-                (
-                    triton.cdiv(routes, block_m) * triton.cdiv(n, block_n),
-                    self.group_size,
-                )
-            ](
+            grid = (
+                triton.cdiv(routes, block_m),
+                triton.cdiv(n, block_n),
+                self.group_size,
+            )
+            _gemm[grid](
                 inputs,
                 self.pointers,
                 self.experts,
