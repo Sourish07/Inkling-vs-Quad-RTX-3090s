@@ -177,9 +177,9 @@ def main(
         )
 
         outputs = torch.cat(outputs, dim=1)
-        for i in range(outputs.shape[0]):
+        for i in range(1, outputs.shape[0]):
             print(f"\n\nExample {i}:")
-            print(tokenizer.decode(outputs[i]))
+            print(tokenizer.decode(outputs[i], skip_special_tokens=True))
 
     # NCCL communicator shutdown waits for every captured graph to be released.
     if decode_graph is not None and decode_graph.graph is not None:
