@@ -170,4 +170,4 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 - I'm currently using `cache.position` to indicate if decode is running (I don't like that)
 - I think I just hardcoded that cache will always be present
 - cursed asf
-- 
+- I think `cache.py` could probably be cleaned up as well
