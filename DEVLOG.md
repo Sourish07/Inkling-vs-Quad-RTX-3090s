@@ -4,6 +4,7 @@
 
 - Literally my first goal is to get just something running; `transformers` sample code won't work because the model is too large to fit across GPUs or even just within host memory.
 - Used agents to create testing suite to ensure parity with transformers implementation
+  - `from transformers import InklingForConditionalGeneration` to jump to reference quickly
 - Architecture broadly makes sense. Using jaxtyping & einops makes tensors ops way more readable
 - For now, omitting caching & vision/audio towers
 - Relative positonal encodings is new to me
@@ -136,6 +137,11 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
     - Also adds residual for the attn-output & mlp-output
   - Paired K/V cache writes, which for sliding window, writes the tokens twice
     - Uses a mirrored ring buffer; cost is double storage
+    - Example (each row has a slide where tokens are in order):
+      - [1, 2, 3, 1, 2, 3]
+      - [4, 2, 3, 4, 2, 3]
+      - [4, 5, 3, 4, 5, 3]
+      - [4, 5, 6, 4, 5, 6]
     - Replaced `torch.roll`, which would create new allocation each time
 - Running at ~14.77 tok/s!
 
@@ -152,6 +158,44 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 ## 12. Paired NVLink/PCIe tensor-parallel reductions
 
 - Ported from SGLang
-- Need to use symmetric memory for potential speed ups
+- GPUs 0 & 1 are connected via NVLink, same with GPUs 2 & 3
+- The PCIe hop depends on driver-level p2p (which I have a patched driver for installed)
+- Need to use PyTorch's symmetric memory for potential speed ups
 - Running at 18.14 tok/s
 
+## Adding batching support (Not an optimization)
+
+- Reasoning about attention masks is complicated
+- I just hardcoded some assumptions for now:
+  - Prefill only runs once, i.e. no multi turn requests (yet)
+  - Prefill length has to be less than or equal to 512 tokens
+    - Otherwise, the sliding window attention mask logic needs extra logic
+- Added some random asserts that need to be cleaned up
+- Cross product of {prefill, decode} and {sliding window, full attn} results in four regimes that need to be handled separately
+- Cleaned up `cache.py`
+  - First, just allocated full kv cache for max seq len at init (will add paging later)
+    - Fine for shorter sequences
+  - Second, removed mirrored buffer
+    - It was originally used as replacement for `torch.roll`
+    - Simple way to always have a single slice return all the keys in order
+      - Easy to calculate distance offsets from
+    - Cuda graphs requires static memory addresses so we couldn't just "slice" the mirrored buffer anymore
+      - Should've just removed the mirrored buffer then...
+      - For decode in full attn layers, the size of the kv buffer is the final sequence length (i.e. `capacity`)
+        - Kinda ineffecient, but we can optimize when we add paging
+      - Simplified `decode_distance` (see fn's docstring)
+- Updated kernels to support bs > 1
+  - bs is now the first dim in the launch grid
+  - requires adding offsets to input tensors
+- Also fused the swiglu(gate) * up operation into the GEMM
+  - The output tile for the first GEMM has half the number of columns now
+  - `gate, up = tl.split(tl.reshape(acc, (BM, BN // 2, 2)))`
+  - `acc` is `BM * BN` with the gate & up being interleaved along columns
+    - As an example, take one row -> `[g0, u0, g1, u1, g2, u2, g3, u3]` | (shape: `(BN,)`)
+    - Goal is -> `[[g0, u0], [g1, u1], [g2, u2], [g3, u3]]` | (shape: `(BN // 2, 2)`)
+    - The 2 remains in the last dim because we want to keep the gate/up pairs together
+    - If we did `.rehape((2, BN // 2))` we would get:
+      - `[[g0, u0, g1, u1], [g2, u2, g3, u3]]` | (shape: `(2, BN // 2)`)
+- Also, changed number of pinned GPU experts from 24 to 20 to accomodate bs=16. (bs=1 is now slower...)
+  - Will add dynamic configuration soon
+  - Running at 17.22 tok/s

@@ -7,7 +7,6 @@ from jaxtyping import Int
 from torch import Tensor as T
 from torch import nn
 from torch.nn import functional as F
-from transformers import InklingForConditionalGeneration
 
 from kernels.decode import rms_norm, short_conv
 
@@ -404,11 +403,8 @@ class MyInklingShortConv(nn.Module):
         cache: MyInklingCache | None = None,
         residual: Fp[T, "bs s d"] | None = None,
     ) -> Fp[T, "bs s d"]:
-        if cache is not None and cache.has_previous_state(
-            self.layer_idx, self.conv_idx
-        ):
+        if cache is not None and cache.tokens_seen > 0:
             # Decode: the kernel shifts the cached history in place.
-            assert hidden_states.shape[:2] == (1, 1)
             history = cache.layers[self.layer_idx].conv_caches[self.conv_idx].cache
             return short_conv(hidden_states, self.conv1d.weight, history, residual)
         input_dtype = hidden_states.dtype
@@ -516,47 +512,72 @@ class MyInklingAttention(nn.Module):
         query_states = self.q_norm(
             q.view(bs, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         )
-        key_states: Fp[T, "bs hk k_len c"] = self.k_norm(
+        key_states: Fp[T, "bs hk s c"] = self.k_norm(
             self.k_sconv(k, cache=cache)  #  Fp[T, "bs s hk_c"]
             .view(bs, q_len, self.num_key_value_heads, self.head_dim)
             .transpose(1, 2)
         )
-        value_states: Fp[T, "bs hk k_len c"] = (
+        value_states: Fp[T, "bs hk s c"] = (
             self.v_sconv(v, cache=cache)  # Fp[T, "bs s hk_c"]
             .view(bs, q_len, self.num_key_value_heads, self.head_dim)
             .transpose(1, 2)
         )
 
         query_start = 0
-        static_decode = cache is not None and cache.position is not None
+        static_decode = cache is not None and cache.decoding
 
         if cache is not None:
-            query_start = cache.layers[self.layer_idx].tokens_seen
+            query_start = cache.tokens_seen
             key_states, value_states = cache.update_attn_cache(
                 key_states, value_states, self.layer_idx
             )
+        # key_states, value_states: Fp[T, "bs hk k_len c"] (k_len = s without a cache)
 
         relative_states: Fp[T, "bs s h r"] = r.view(bs, q_len, self.num_heads, -1)
 
         kv_len = key_states.shape[2]
         if static_decode:
-            distance = cache.decode_distance(self.layer_idx)
-            position_bias = self.rel_logits_proj(relative_states, distance)
-            allowed = (distance >= 0) & (distance <= cache.position)
-            sdpa_mask = position_bias.masked_fill(~allowed, float("-inf"))
+            # in this branch s = 1 (i.e number of queries)
+            distance: Int[T, "1 k_len"] = cache.decode_distance(self.layer_idx)
+            position_bias: Fp[T, "bs h 1 k_len"] = self.rel_logits_proj(
+                relative_states, distance
+            )
+            # cache.position: int single value
+            # cache.pad_counts: bs
+            assert cache.pad_counts is not None
+            # sdpa_mask is 4 dimensional so in order for pad_counts to broadcast correctly,
+            # we need the "bs" dimensions to align, which is why we add three extra dimensions to the right
+            # sdpa_mask: (bs, h, 1, k_len) & pad_counts: (bs, 1, 1, 1)
+            pad_counts = cache.pad_counts.view(-1, 1, 1, 1)
+            allowed = (distance >= 0) & (distance <= cache.position - pad_counts)
+            sdpa_mask: Fp[T, "bs h 1 k_len"] = position_bias.masked_fill(
+                ~allowed, float("-inf")
+            )
+            # sdpa_mask: Fp[T, "bs h 1 k_len"]
         else:
             # Relative distances do not depend on the absolute cache position.
+            columns = torch.arange(kv_len, device=hidden_states.device)
+
             distance: Int[T, "s k_len"] = (
                 torch.arange(q_len, device=hidden_states.device)[:, None]
                 + kv_len
                 - q_len
-                - torch.arange(kv_len, device=hidden_states.device)[None, :]
+                - columns[None, :]
             )
             position_bias = self.rel_logits_proj(relative_states, distance)
             allowed = distance >= 0
             if self.sliding_window is not None:
                 allowed &= distance < self.sliding_window
             sdpa_mask = position_bias.masked_fill(~allowed, float("-inf"))
+            # sdpa_mask: Fp[T, "bs h s k_len"]
+            assert sdpa_mask.shape[2] <= 512  # TODO: we'll deal with this later
+            if cache is not None:
+                assert cache.pad_counts is not None
+                is_pad = columns < cache.pad_counts.view(-1, 1, 1, 1)
+                sdpa_mask = sdpa_mask.masked_fill(is_pad, float("-inf"))
+                # We don't need to mask out the rows because the causal mask already covers them
+
+        # allowed: Bool[T, "s k_len"]
 
         # Inkling scales both content scores and relative bias in full attention.
         if (
@@ -676,8 +697,20 @@ class MyInklingTextTower(nn.Module):
     def forward(
         self, input_ids: Int[T, "bs s"], cache: MyInklingCache | None = None
     ) -> Fp[T, "bs s d"]:
-        """Process unpadded tokens with an optional request-scoped cache."""
-        hidden_states = self.embed_tokens(input_ids)
+        hidden_states: Fp[T, "bs s d"] = self.embed_tokens(input_ids)
+
+        if cache is not None and not cache.decoding:
+            # only run for prefill
+            assert cache.pad_counts is not None
+            # cache.pad_counts: Fp[T, " bs"]
+            seq_len: Fp[T, " s"] = torch.arange(
+                hidden_states.shape[1], device=hidden_states.device
+            )
+            is_pad: Fp[T, "bs s 1"] = (
+                seq_len < cache.pad_counts.view(-1, 1)
+            ).unsqueeze(-1)
+            hidden_states.masked_fill_(is_pad, 0)
+
         for layer in self.layers:
             hidden_states = layer(hidden_states, cache=cache)
         return self.norm(hidden_states)
@@ -736,6 +769,6 @@ class MyInkling(nn.Module):
             if unpadded_vocab_size is not None
             else padded_logits
         )
-        if cache is not None and cache.position is not None:
-            cache.position.add_(1)
+        if cache is not None:
+            cache.advance(input_ids.shape[1])
         return logits

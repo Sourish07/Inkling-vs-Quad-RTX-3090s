@@ -51,7 +51,7 @@ def cache_directory(model, checkpoint_dir, mesh, *, experts=False, gpu_experts=N
         :20
     ]
     root = Path(
-        os.environ.get("INKLING_FLASHPACK_CACHE", checkpoint_dir / ".flashpack")
+        os.environ.get("INKLING_FLASHPACK_CACHE", Path(__file__).resolve().parent.parent / ".flashpack")
     )
     return root / ("experts" if experts else "non-experts") / digest
 
@@ -108,6 +108,11 @@ def _direct_reader(path):
     pinned experts for host memory, while the parallel CUDA reader's threads
     each open a context on cuda:0, costing rank 0 256 MiB per other rank.
     """
+    if os.environ.get("INKLING_SKIP_WEIGHTS") == "1":
+        logger.info("Skipping weights loading from disk")
+        # Headers still size and place every tensor; contents are zeros, not weights.
+        yield lambda start, target: target.zero_()
+        return
     # O_DIRECT needs block-aligned offsets, lengths, and memory; tensors are only
     # aligned to FlashPack's align_bytes, so bounce through an aligned buffer.
     # Large sequential reads keep the device queue full, unlike per-tensor reads.

@@ -1,5 +1,4 @@
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import tyro
@@ -18,6 +17,7 @@ from my_inkling import MyInkling, MyInklingCache, apply_ep_plan, apply_tp_plan
 from my_inkling.decode_graph import DecodeGraph
 from utils import (
     Profiler,
+    Timer,
     get_device_mesh,
     load_config,
     load_expert_state_dict,
@@ -32,7 +32,9 @@ hf_repo = "thinkingmachines/Inkling-Small-NVFP4"
 def main(
     profile: bool = False,
     log2_max_new_tokens: int = 7,
-    gpu_experts_per_rank: int = 24,
+    gpu_experts_per_rank: int = 20,
+    cuda_graph: bool = True,
+    batch_size: int = 1,
 ) -> None:
     """Generate from the sharded Inkling model and report decode throughput.
 
@@ -41,6 +43,8 @@ def main(
         log2_max_new_tokens: Generate at most 2**log2_max_new_tokens tokens.
         gpu_experts_per_rank: First N experts in each rank's shard stay on GPU; the
             rest use pinned CPU RAM.
+        cuda_graph: Replay decode steps from a captured CUDA graph; disable to run
+            them eagerly.
     """
     device, local_rank = setup_ddp_local()
     world_size = get_world_size()
@@ -60,9 +64,10 @@ def main(
             apply_tp_plan(model, config, device_mesh)
 
     logger.info("Loading state dict into sharded model")
-    non_expert_state_dict = load_non_expert_state_dict(
-        model, local_hf_path, device_mesh
-    )
+    with Timer("Non-expert checkpoint loading"):
+        non_expert_state_dict = load_non_expert_state_dict(
+            model, local_hf_path, device_mesh
+        )
     missing, unexpected = model.load_state_dict(
         non_expert_state_dict, strict=False, assign=True
     )
@@ -70,27 +75,34 @@ def main(
     del non_expert_state_dict
     model.fuse_attention_projections()
 
-    expert_state_dict = load_expert_state_dict(
-        model, local_hf_path, device_mesh, gpu_experts_per_rank
-    )
+    with Timer("Expert checkpoint loading"):
+        expert_state_dict = load_expert_state_dict(
+            model, local_hf_path, device_mesh, gpu_experts_per_rank
+        )
     apply_ep_plan(model, device_mesh, expert_state_dict, num_slots=10)
 
     torch.distributed.barrier()
     logger.info(f"Inkling model loaded on device {device}")
 
-    prompt_text = "What are the computational benefits of Mixture-of-Experts models?"
-    prompt = [{"role": "user", "content": prompt_text}]
+    with open("prompts.txt", "r") as f:
+        prompt_text = f.readlines()[:batch_size]
+    prompt = [[{"role": "user", "content": txt.strip()}] for txt in prompt_text]
 
     logger.info("Running tokenizer...")
+    tokenizer.padding_side = "left"
+    tokenizer.pad_token = tokenizer.convert_ids_to_tokens(config.eos_token_id)
+
     inputs: BatchEncoding = tokenizer.apply_chat_template(
         prompt,
         add_generation_prompt=True,
         return_tensors="pt",
         return_dict=True,
         reasoning_effort="none",
+        padding=True,
     )
     inputs = inputs.to(device)
     num_tokens = inputs["input_ids"].shape[1]
+    pad_count = num_tokens - inputs["attention_mask"].sum(dim=1)
     logger.info(f"running generation with {num_tokens} input tokens")
 
     model.eval()
@@ -98,18 +110,20 @@ def main(
     streamer = (
         TextStreamer(tokenizer, skip_special_tokens=True) if local_rank == 0 else None
     )
-    output_pool = ThreadPoolExecutor(max_workers=1) if streamer is not None else None
-    output_future = None
     next_input = inputs["input_ids"]
 
     # Step 0 is prefill (+ first token); the decode clock starts after it.
     decode_start = 0.0
     num_decode_tokens = 0
-    cache = MyInklingCache(config.text_config)
+    capacity = num_tokens + max_new_tokens - 1
+    cache = MyInklingCache(config.text_config, batch_size, capacity, pad_count)
     decode_graph = None
 
     profiler = Profiler(enable=profile)
     profiler.start()
+
+    finished = torch.zeros(batch_size, dtype=torch.bool)
+    outputs = []
 
     with torch.inference_mode():
         for step in range(max_new_tokens):
@@ -123,32 +137,35 @@ def main(
                 else:
                     assert decode_graph is not None
                     next_input = decode_graph.replay()
+
             host_token = next_input.cpu()
+            outputs.append(host_token)
             if streamer is not None:
-                assert output_pool is not None
-                if output_future is not None:
-                    output_future.result()
-                output_future = output_pool.submit(streamer.put, host_token)
-            is_eos = host_token.item() == tokenizer.eos_token_id
+                streamer.put(host_token[:1])
+
+            finished |= host_token[:, 0] == tokenizer.eos_token_id
+
             if step == 0:
-                if not is_eos and max_new_tokens > 1:
-                    logger.info("Warming up and capturing complete decode CUDA graph")
+                if max_new_tokens > 1:
+                    logger.info(
+                        "Warming up and capturing complete decode CUDA graph"
+                        if cuda_graph
+                        else "Warming up eager decode (CUDA graph disabled)"
+                    )
                     decode_graph = DecodeGraph(
                         model,
                         cache,
                         next_input,
-                        capacity=num_tokens + max_new_tokens - 1,
+                        capture=cuda_graph,
                     )
                     decode_start = time.perf_counter()
             else:
                 num_decode_tokens += 1
-            if is_eos:
+
+            if finished.all():
                 break
 
     if streamer is not None:
-        assert output_pool is not None and output_future is not None
-        output_future.result()
-        output_pool.shutdown()
         streamer.end()
     decode_time = time.perf_counter() - decode_start
     profiler.stop()
@@ -159,8 +176,13 @@ def main(
             f"= {num_decode_tokens / decode_time:.2f} tok/s (excl. prefill)"
         )
 
+        outputs = torch.cat(outputs, dim=1)
+        for i in range(1, outputs.shape[0]):
+            print(f"\n\nExample {i}:")
+            print(tokenizer.decode(outputs[i], skip_special_tokens=True))
+
     # NCCL communicator shutdown waits for every captured graph to be released.
-    if decode_graph is not None:
+    if decode_graph is not None and decode_graph.graph is not None:
         torch.cuda.synchronize()
         decode_graph.graph.reset()
     torch.distributed.destroy_process_group()

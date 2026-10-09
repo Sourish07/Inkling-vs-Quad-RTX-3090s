@@ -5,6 +5,9 @@ Grouped expert projections over checkpoint-layout BF16 or NVFP4 weights.
 import torch
 import triton
 import triton.language as tl
+from jaxtyping import Float as Fp
+from jaxtyping import Int
+from torch import Tensor as T
 
 
 @triton.jit
@@ -32,11 +35,13 @@ def _gemm(
     NVFP4 inline. This lets one launch cover all active experts, wherever their
     weights are, with no launch per expert and no dequantized copy of the weights.
     """
-    group = tl.program_id(1)
-    tile = tl.program_id(0)
-    row = tile // tl.cdiv(N, BN) * BM + tl.arange(0, BM)
+    row_tile_number = tl.program_id(0)
+    column_tile_number = tl.program_id(1)
+    group = tl.program_id(2)
+    row = row_tile_number * BM + tl.arange(0, BM)
     count = tl.load(Counts + group)
-    if tile // tl.cdiv(N, BN) * BM < count:
+
+    if row_tile_number * BM < count:
         expert = tl.load(Experts + group)
         pointer_stride = 6 if QUANTIZED else 2
         projection_stride = 3 if QUANTIZED else 1
@@ -44,14 +49,17 @@ def _gemm(
         dtype = X.dtype.element_ty
         weight_dtype = tl.uint8 if QUANTIZED else dtype
         weight = tl.load(pointers).to(tl.pointer_type(weight_dtype))
+
         if QUANTIZED:
             scale = tl.load(pointers + 1).to(tl.pointer_type(tl.uint8))
             scale2 = tl.load(tl.load(pointers + 2).to(tl.pointer_type(tl.float32)))
+
         route = tl.load(Rows + group * CAPACITY + row, row < count, 0)
         input_row = route // TOP_K if PROJECTION == 0 else route
-        cols = tile % tl.cdiv(N, BN) * BN + tl.arange(0, BN)
+        cols = column_tile_number * BN + tl.arange(0, BN)
         ks = tl.arange(0, BK)
         acc = tl.zeros((BM, BN), tl.float32)
+
         for start in range(tl.cdiv(K, BK)):
             k = start * BK + ks
             a = tl.load(
@@ -59,6 +67,7 @@ def _gemm(
                 (row[:, None] < count) & (k[None, :] < K),
                 0,
             )
+
             if QUANTIZED:
                 packed = tl.load(
                     weight + cols[None, :] * (K // 2) + k[:, None] // 2,
@@ -78,6 +87,7 @@ def _gemm(
                     ),
                 )
                 value = tl.where((code & 8) != 0, -value, value)
+
                 bits = tl.load(
                     scale + cols[None, :] * (K // 16) + k[:, None] // 16,
                     (cols[None, :] < N) & (k[:, None] < K),
@@ -100,11 +110,29 @@ def _gemm(
                     (cols[None, :] < N) & (k[:, None] < K),
                     0,
                 )
+
             acc += tl.dot(a, b)
+
+        if PROJECTION == 0:
+            # acc: (BM, BN)
+            # output matrix: (self.capacity, self.intermediate_dim)
+            gate, up = tl.split(tl.reshape(acc, (BM, BN // 2, 2)))  # See DEVLOG.md
+            activated = gate * tl.sigmoid(gate)  # Swiglu
+
+            # Output tile: (BM, BN // 2)
+            _cols = column_tile_number * (BN // 2) + tl.arange(0, BN // 2)
+            _N = N // 2
+            output = (activated * up).to(dtype)
+        else:
+            # Output tile: (BM, BN)
+            _cols = cols
+            _N = N
+            output = acc.to(dtype)
+
         tl.store(
-            Y + route[:, None] * N + cols[None, :],
-            acc.to(dtype),
-            (row[:, None] < count) & (cols[None, :] < N),
+            Y + route[:, None] * _N + _cols[None, :],
+            output,
+            (row[:, None] < count) & (_cols[None, :] < _N),
         )
 
 
@@ -153,6 +181,9 @@ class GroupedExperts:
     - Routing workspace: self.experts, self.counts, self.rows
     - Projection scratch: self.gate_up, self.activated, self.down
 
+    "routes" are defined as one (token, expert) pair!
+    - (i.e. we're routing that token to that expert)
+
     Calls run sequentially on the module's compute stream. The output is owned
     by the caller; internal buffers are overwritten on the next call.
     """
@@ -182,6 +213,8 @@ class GroupedExperts:
         self.experts = torch.empty(len(expert_ids), dtype=torch.int32, device=device)
         self.counts = torch.empty(len(expert_ids), dtype=torch.int32, device=device)
         self.capacity = 0
+        # Number of expert groups that one _gemm launch covers
+        # a "group" is one active local expert along with all tokens routed to that expert
         self.group_size = 0  # Set by ExpertCache.prepare before each forward.
 
     def reserve(self, routes):
@@ -193,18 +226,22 @@ class GroupedExperts:
         """
         if routes <= self.capacity:
             return
+
         self.capacity = triton.next_power_of_2(routes)
         self.rows = torch.empty(
             (len(self.experts), self.capacity), dtype=torch.int32, device=self.device
         )
         options = {"dtype": self.dtype, "device": self.device}
-        self.gate_up = torch.empty(
-            (self.capacity, 2 * self.intermediate_dim), **options
-        )
         self.activated = torch.empty((self.capacity, self.intermediate_dim), **options)
         self.down = torch.empty((self.capacity, self.hidden_dim), **options)
 
-    def forward(self, x, indices, weights, output):
+    def forward(
+        self,
+        x: Fp[T, "t d"],
+        indices: Int[T, "t k"],
+        weights: Fp[T, "t k"],
+        output: Fp[T, "t d"],
+    ) -> None:
         """
         Run gate/up, activation, down and the weighted sum for all active experts.
 
@@ -212,15 +249,24 @@ class GroupedExperts:
         and rows that these kernels read. The number of launches is then fixed per
         layer and does not depend on how many experts are active.
         """
-        routes = indices.numel()
+        routes = indices.numel()  # num_tokens * top_k
         self.reserve(routes)
         top_k = indices.shape[1]
+        block_m = 16
+        block_n = 64
+        block_k = 64
+
         for projection, inputs, target, n, k in (
-            (0, x, self.gate_up, 2 * self.intermediate_dim, self.hidden_dim),
+            (0, x, self.activated, 2 * self.intermediate_dim, self.hidden_dim),
             (1, self.activated, self.down, self.hidden_dim, self.intermediate_dim),
         ):
             # The GPU planner compacts active groups; unused groups have count zero.
-            _gemm[(triton.cdiv(routes, 16) * triton.cdiv(n, 64), self.group_size)](
+            grid = (
+                triton.cdiv(routes, block_m),
+                triton.cdiv(n, block_n),
+                self.group_size,
+            )
+            _gemm[grid](
                 inputs,
                 self.pointers,
                 self.experts,
@@ -233,18 +279,11 @@ class GroupedExperts:
                 top_k,
                 projection,
                 self.quantized,
-                16,
-                64,
-                64,
+                block_m,
+                block_n,
+                block_k,
             )
-            # TODO: I can probably fuse
-            if projection == 0:
-                projected = self.gate_up[:routes]
-                torch.mul(
-                    self.act_fn(projected[:, 0::2]),
-                    projected[:, 1::2],
-                    out=self.activated[:routes],
-                )
+
         _reduce[(x.shape[0], triton.cdiv(self.hidden_dim, 256))](
             self.down,
             indices,

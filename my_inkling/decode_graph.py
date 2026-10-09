@@ -6,14 +6,14 @@ import torch.distributed as dist
 
 class DecodeGraph:
     @torch.inference_mode()
-    def __init__(self, model, cache, next_token, capacity):
-        assert next_token.is_cuda and next_token.shape == (1, 1)
+    def __init__(self, model, cache, next_token, capture=True):
+        assert next_token.is_cuda
         assert not model.training
         self.model = model
         self.cache = cache
         self.token = next_token.clone()
-        self.remaining = capacity - cache.layers[0].tokens_seen
-        cache.prepare_decode(capacity)
+        self.remaining = cache.capacity - cache.tokens_seen
+        cache.prepare_decode()
         buffers = [self.token, *cache.decode_buffers()]
         saved = [buffer.clone() for buffer in buffers]
 
@@ -32,10 +32,13 @@ class DecodeGraph:
         torch.cuda.synchronize()
         if dist.is_initialized():
             dist.barrier()
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph, stream=stream):
-            self._step()
-        restore()
+        # Without capture, replay() runs the same step eagerly.
+        self.graph = None
+        if capture:
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph, stream=stream):
+                self._step()
+            restore()
         torch.cuda.synchronize()
 
     def _step(self):
@@ -48,5 +51,8 @@ class DecodeGraph:
         # A host bound prevents out-of-range writes without reading GPU state.
         assert self.remaining > 0, "decode graph capacity exhausted"
         self.remaining -= 1
-        self.graph.replay()
+        if self.graph is None:
+            self._step()
+        else:
+            self.graph.replay()
         return self.token
