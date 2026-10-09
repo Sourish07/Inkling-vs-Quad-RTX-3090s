@@ -558,11 +558,13 @@ class MyInklingAttention(nn.Module):
             # sdpa_mask: Fp[T, "bs h 1 k_len"]
         else:
             # Relative distances do not depend on the absolute cache position.
+            columns = torch.arange(kv_len, device=hidden_states.device)
+
             distance: Int[T, "s k_len"] = (
                 torch.arange(q_len, device=hidden_states.device)[:, None]
                 + kv_len
                 - q_len
-                - torch.arange(kv_len, device=hidden_states.device)[None, :]
+                - columns[None, :]
             )
             position_bias = self.rel_logits_proj(relative_states, distance)
             allowed = distance >= 0
@@ -570,14 +572,12 @@ class MyInklingAttention(nn.Module):
                 allowed &= distance < self.sliding_window
             sdpa_mask = position_bias.masked_fill(~allowed, float("-inf"))
             # sdpa_mask: Fp[T, "bs h s k_len"]
-            # For now, assume s < 512
             assert sdpa_mask.shape[2] <= 512  # TODO: we'll deal with this later
-            # TODO: vectorize this part
             if cache is not None:
-                for b in range(sdpa_mask.shape[0]):
-                    sdpa_mask[b, :, :, : cache.pad_counts[b]] = float("-inf")
-                    # This is not needed because the causal mask already covers it
-                    # sdpa_mask[b, :, : cache.pad_counts[b], :] = float("-inf")
+                assert cache.pad_counts is not None
+                is_pad = columns < cache.pad_counts.view(-1, 1, 1, 1)
+                sdpa_mask = sdpa_mask.masked_fill(is_pad, float("-inf"))
+                # We don't need to mask out the rows because the causal mask already covers them
 
         # allowed: Bool[T, "s k_len"]
 
@@ -699,13 +699,19 @@ class MyInklingTextTower(nn.Module):
     def forward(
         self, input_ids: Int[T, "bs s"], cache: MyInklingCache | None = None
     ) -> Fp[T, "bs s d"]:
-        hidden_states = self.embed_tokens(input_ids)
+        hidden_states: Fp[T, "bs s d"] = self.embed_tokens(input_ids)
 
-        # TODO: vectorize this part
         if cache is not None and cache.position is None:
             # only run for prefill
-            for b in range(hidden_states.shape[0]):
-                hidden_states[b, : cache.pad_counts[b]] = 0
+            assert cache.pad_counts is not None
+            # cache.pad_counts: Fp[T, " bs"]
+            seq_len: Fp[T, " s"] = torch.arange(
+                hidden_states.shape[1], device=hidden_states.device
+            )
+            is_pad: Fp[T, "bs s 1"] = (
+                seq_len < cache.pad_counts.view(-1, 1)
+            ).unsqueeze(-1)
+            hidden_states.masked_fill_(is_pad, 0)
 
         for layer in self.layers:
             hidden_states = layer(hidden_states, cache=cache)
