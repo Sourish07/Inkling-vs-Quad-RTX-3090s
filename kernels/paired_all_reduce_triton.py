@@ -75,12 +75,15 @@ def _paired_all_reduce(
     from_nvlink = phase * 2 * SLOT
     from_pcie = from_nvlink + SLOT
 
+    # Phase 1: push my input to my nvlink partner
     for start in range(pid * BLOCK, n, stride):
         offsets = start + tl.arange(0, BLOCK)
         mask = offsets < n
         local = _mark(tl.load(X + offsets, mask, 0), SIGN)
         tl.store(Nvlink + from_nvlink + offsets, local, mask)
 
+    # Phase 2: add my input to my nvlink partner's input
+    # also push over PCIe
     for start in range(pid * BLOCK, n, stride):
         offsets = start + tl.arange(0, BLOCK)
         mask = offsets < n
@@ -90,6 +93,7 @@ def _paired_all_reduce(
         tl.store(Pcie + from_pcie + offsets, _mark(pair, SIGN), mask)
         tl.store(Out + offsets, pair, mask)
 
+    # Phase 3: add the other pair's sum
     for start in range(pid * BLOCK, n, stride):
         offsets = start + tl.arange(0, BLOCK)
         mask = offsets < n
