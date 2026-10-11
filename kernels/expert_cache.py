@@ -2,13 +2,12 @@
 GPU cache planning and onload from CUDA-mapped pinned checkpoint tensors.
 """
 
-import torch
 import triton
 import triton.language as tl
 
 
 @triton.jit
-def _plan(
+def expert_plan(
     Indices,
     Sources,
     Resident,
@@ -114,7 +113,7 @@ def _plan(
 
 
 @triton.jit
-def _copy(
+def expert_copy(
     Sources,
     Destinations,
     CopyExperts,
@@ -124,7 +123,8 @@ def _copy(
     WORKERS: tl.constexpr,
 ):
     """
-    Copy the expert that `_plan` assigned to this slot from host memory into the slot.
+    Copy the expert that `expert_plan` assigned to this slot from host memory into
+    the slot.
 
     Only the GPU knows which experts missed the cache, so the host cannot start
     these copies. Each program reads the pinned host weights directly; WORKERS
@@ -145,114 +145,3 @@ def _copy(
                 offsets = tile * BLOCK + tl.arange(0, BLOCK)
                 value = tl.load(source + offsets, offsets < SIZES[bank], 0)
                 tl.store(target + offsets, value, offsets < SIZES[bank])
-
-
-class ExpertCache:
-    """
-    Contiguous EP shard; fixed GPU residents, LRU slots, sequential forwards.
-    """
-
-    def __init__(self, weights, names, num_slots, grouped):
-        """
-        Allocate the cache slots and the address tables that the planner selects from.
-
-        Every address a pointer-table entry can hold (resident tensor, pinned host
-        tensor or cache slot) is recorded here once, so a forward does no host work
-        to find weights.
-        """
-        self.weights = weights  # Keep mapped host allocations alive.
-        ids = sorted(weights[names[0]])
-        self.start = ids[0]
-        self.local = len(ids)
-        assert ids == list(range(self.start, self.start + self.local))
-        assert num_slots > 0
-        self.num_slots = num_slots
-        self.stride = len(names)
-        device = grouped.device
-        self.banks = [
-            torch.empty(
-                (num_slots, *weights[name][ids[0]].shape),
-                dtype=weights[name][ids[0]].dtype,
-                device=device,
-            )
-            for name in names
-        ]
-        # GPU kernels read host weights by address, so they must be pinned.
-        assert all(
-            w.is_contiguous() and (w.is_cuda or w.is_pinned())
-            for name in names
-            for w in weights[name].values()
-        )
-        self.sources = torch.tensor(
-            [[weights[name][e].data_ptr() for name in names] for e in ids],
-            dtype=torch.int64,
-            device=device,
-        )
-        self.destinations = torch.tensor(
-            [[bank[s].data_ptr() for bank in self.banks] for s in range(num_slots)],
-            dtype=torch.int64,
-            device=device,
-        )
-        self.resident = torch.tensor(
-            [weights[names[0]][e].is_cuda for e in ids],
-            dtype=torch.int32,
-            device=device,
-        )
-        byte_sizes = [
-            weights[name][ids[0]].numel() * weights[name][ids[0]].element_size()
-            for name in names
-        ]
-        assert all(size % 4 == 0 for size in byte_sizes)
-        self.sizes = tuple(size // 4 for size in byte_sizes)
-        self.slot_experts = torch.full(
-            (num_slots,), -1, dtype=torch.int32, device=device
-        )
-        self.ages = torch.zeros(num_slots, dtype=torch.int32, device=device)
-        self.clock = torch.zeros((), dtype=torch.int32, device=device)
-        self.copy_experts = torch.empty(num_slots, dtype=torch.int32, device=device)
-        self.grouped = grouped
-
-    def prepare(self, indices):
-        """
-        Plan this forward's routing and cache state, then load the missing experts.
-
-        Must run before `GroupedExperts.forward`. The host does not know how many
-        experts are active, so `group_size` is set to the upper bound and unused
-        groups have a count of zero.
-        """
-        routes = indices.numel()
-        self.grouped.reserve(routes)
-        _plan[(1,)](
-            indices,
-            self.sources,
-            self.resident,
-            self.destinations,
-            self.slot_experts,
-            self.ages,
-            self.clock,
-            self.copy_experts,
-            self.grouped.pointers,
-            self.grouped.experts,
-            self.grouped.counts,
-            self.grouped.rows,
-            self.start,
-            self.local,
-            self.num_slots,
-            self.stride,
-            routes,
-            self.grouped.capacity,
-            triton.next_power_of_2(self.local),
-            triton.next_power_of_2(self.num_slots),
-            triton.next_power_of_2(routes),
-            num_warps=4,
-        )
-        _copy[(128, self.num_slots)](
-            self.sources,
-            self.destinations,
-            self.copy_experts,
-            self.sizes,
-            self.stride,
-            1024,
-            128,
-        )
-        self.grouped.group_size = min(routes, self.local)

@@ -2,16 +2,12 @@
 Grouped expert projections over checkpoint-layout BF16 or NVFP4 weights.
 """
 
-import torch
 import triton
 import triton.language as tl
-from jaxtyping import Float as Fp
-from jaxtyping import Int
-from torch import Tensor as T
 
 
 @triton.jit
-def _gemm(
+def expert_gemm(
     X,
     Pointers,
     Experts,
@@ -137,7 +133,7 @@ def _gemm(
 
 
 @triton.jit
-def _reduce(
+def expert_reduce(
     Down,
     Indices,
     Weights,
@@ -172,127 +168,3 @@ def _reduce(
         acc += (value * weight).to(Down.dtype.element_ty).to(tl.float32)
     output = Output + token * WIDTH + cols
     tl.store(output, tl.load(output, cols < WIDTH, 0) + acc, cols < WIDTH)
-
-
-class GroupedExperts:
-    """
-    Reusable pointer table, routing workspace and projection scratch for one layer.
-    - Pointer table: self.pointers
-    - Routing workspace: self.experts, self.counts, self.rows
-    - Projection scratch: self.gate_up, self.activated, self.down
-
-    "routes" are defined as one (token, expert) pair!
-    - (i.e. we're routing that token to that expert)
-
-    Calls run sequentially on the module's compute stream. The output is owned
-    by the caller; internal buffers are overwritten on the next call.
-    """
-
-    def __init__(
-        self, expert_ids, hidden_dim, intermediate_dim, dtype, device, quantized, act_fn
-    ):
-        """
-        Allocate the pointer table, group list and counts on the GPU once.
-
-        The cache planner rewrites them on the GPU each forward, so the hot path
-        needs no allocation and no host upload.
-        """
-        self.max_expert = max(expert_ids)
-        self.hidden_dim = hidden_dim
-        self.intermediate_dim = intermediate_dim
-        self.dtype = dtype
-        self.device = device
-        self.quantized = quantized
-        self.act_fn = act_fn
-        self.pointer_stride = 6 if quantized else 2
-        self.pointers = torch.zeros(
-            (self.max_expert + 1) * self.pointer_stride,
-            dtype=torch.int64,
-            device=device,
-        )
-        self.experts = torch.empty(len(expert_ids), dtype=torch.int32, device=device)
-        self.counts = torch.empty(len(expert_ids), dtype=torch.int32, device=device)
-        self.capacity = 0
-        # Number of expert groups that one _gemm launch covers
-        # a "group" is one active local expert along with all tokens routed to that expert
-        self.group_size = 0  # Set by ExpertCache.prepare before each forward.
-
-    def reserve(self, routes):
-        """
-        Grow the routing rows and projection scratch to hold `routes` routes.
-
-        Prefill has many more routes than decode. Growing to a power of two and
-        never shrinking lets later forwards reuse the same buffers.
-        """
-        if routes <= self.capacity:
-            return
-
-        self.capacity = triton.next_power_of_2(routes)
-        self.rows = torch.empty(
-            (len(self.experts), self.capacity), dtype=torch.int32, device=self.device
-        )
-        options = {"dtype": self.dtype, "device": self.device}
-        self.activated = torch.empty((self.capacity, self.intermediate_dim), **options)
-        self.down = torch.empty((self.capacity, self.hidden_dim), **options)
-
-    def forward(
-        self,
-        x: Fp[T, "t d"],
-        indices: Int[T, "t k"],
-        weights: Fp[T, "t k"],
-        output: Fp[T, "t d"],
-    ) -> None:
-        """
-        Run gate/up, activation, down and the weighted sum for all active experts.
-
-        `ExpertCache.prepare` must run first: it fills the pointers, groups, counts
-        and rows that these kernels read. The number of launches is then fixed per
-        layer and does not depend on how many experts are active.
-        """
-        routes = indices.numel()  # num_tokens * top_k
-        self.reserve(routes)
-        top_k = indices.shape[1]
-        block_m = 16
-        block_n = 64
-        block_k = 64
-
-        for projection, inputs, target, n, k in (
-            (0, x, self.activated, 2 * self.intermediate_dim, self.hidden_dim),
-            (1, self.activated, self.down, self.hidden_dim, self.intermediate_dim),
-        ):
-            # The GPU planner compacts active groups; unused groups have count zero.
-            grid = (
-                triton.cdiv(routes, block_m),
-                triton.cdiv(n, block_n),
-                self.group_size,
-            )
-            _gemm[grid](
-                inputs,
-                self.pointers,
-                self.experts,
-                self.rows,
-                self.counts,
-                target,
-                self.capacity,
-                n,
-                k,
-                top_k,
-                projection,
-                self.quantized,
-                block_m,
-                block_n,
-                block_k,
-            )
-
-        _reduce[(x.shape[0], triton.cdiv(self.hidden_dim, 256))](
-            self.down,
-            indices,
-            weights,
-            self.pointers,
-            output,
-            self.hidden_dim,
-            top_k,
-            self.pointer_stride,
-            self.max_expert,
-            256,
-        )
