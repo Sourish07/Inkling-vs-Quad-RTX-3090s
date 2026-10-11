@@ -98,15 +98,17 @@ def load_non_expert_state_dict(rank, device):
     }
 
 
-def load_expert_state_dict(rank, device, gpu_experts_per_rank):
+def load_expert_state_dict(rank, device, gpu_experts_per_rank, full_tp=False):
     """
     Read this rank's experts as {weight_name: {global_expert_id: tensor}}.
 
-    The first gpu_experts_per_rank experts of the shard go to device; the rest
-    each get their own pinned allocation. NVFP4 weights stay packed, with their
+    full_tp reads the pack holding this rank's slice of every expert instead of
+    its share of whole experts. The first gpu_experts_per_rank experts of the
+    shard go to device; the rest each get their own pinned allocation. NVFP4 weights stay packed, with their
     _scale and _scale2 banks; gate/up rows stay interleaved as in the checkpoint.
     """
-    path = FLASHPACK_DIR / f"experts-rank-{rank}.flashpack"
+    prefix = "experts-tp" if full_tp else "experts"
+    path = FLASHPACK_DIR / f"{prefix}-rank-{rank}.flashpack"
     blocks, records = _layout(path)
 
     def span(record):

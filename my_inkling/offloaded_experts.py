@@ -54,6 +54,7 @@ class OffloadedExperts(nn.Module):
         ]
         self.weight_names = [name for names in self.projection_names for name in names]
 
+        # 64 in EP & 256 in TP
         self.local_expert_ids = set(weights["down_proj"])
         device = torch.device("cuda", torch.cuda.current_device())
 
