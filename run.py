@@ -13,7 +13,7 @@ from transformers import (
     TextStreamer,
 )
 
-from my_inkling import MyInkling, MyInklingCache, apply_ep_plan, apply_tp_plan
+from my_inkling import MyInkling, MyInklingCache, apply_offload_plan, apply_tp_plan
 from my_inkling.decode_graph import DecodeGraph
 from utils import (
     Profiler,
@@ -32,7 +32,9 @@ hf_repo = "thinkingmachines/Inkling-Small-NVFP4"
 def main(
     profile: bool = False,
     log2_max_new_tokens: int = 7,
-    gpu_experts_per_rank: int = 20,
+    full_tp: bool = False,
+    gpu_experts_per_rank: int | None = None,
+    cache_slots: int | None = None,
     cuda_graph: bool = True,
     batch_size: int = 1,
 ) -> None:
@@ -41,8 +43,13 @@ def main(
     Args:
         profile: Record a torch profiler trace of generation on rank 0.
         log2_max_new_tokens: Generate at most 2**log2_max_new_tokens tokens.
+        full_tp: Slice every routed expert across the ranks like the other layers,
+            instead of giving each rank a quarter of the experts whole.
         gpu_experts_per_rank: First N experts in each rank's shard stay on GPU; the
-            rest use pinned CPU RAM.
+            rest use pinned CPU RAM. Defaults to 20 whole experts, or 80 slices
+            with full_tp (the same VRAM).
+        cache_slots: GPU cache slots per rank and layer for the experts in CPU RAM.
+            Defaults to 10 whole experts, or 40 slices with full_tp.
         cuda_graph: Replay decode steps from a captured CUDA graph; disable to run
             them eagerly.
     """
@@ -50,6 +57,11 @@ def main(
     world_size = get_world_size()
     setup_rank_aware_logger()
     device_mesh = get_device_mesh(num_dimensions=1)
+
+    if gpu_experts_per_rank is None:
+        gpu_experts_per_rank = 80 if full_tp else 20
+    if cache_slots is None:
+        cache_slots = 40 if full_tp else 10
 
     tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
         hf_repo, trust_remote_code=True
@@ -61,7 +73,7 @@ def main(
         model = MyInkling(config).bfloat16()
         model.restore_fp32()
         if world_size > 1:
-            apply_tp_plan(model, config, device_mesh)
+            apply_tp_plan(model, config, device_mesh, full_tp=full_tp)
 
     logger.info("Loading state dict into sharded model")
     with Timer("Non-expert checkpoint loading"):
@@ -75,9 +87,9 @@ def main(
 
     with Timer("Expert checkpoint loading"):
         expert_state_dict = load_expert_state_dict(
-            local_rank, device, gpu_experts_per_rank
+            local_rank, device, gpu_experts_per_rank, full_tp
         )
-    apply_ep_plan(model, device_mesh, expert_state_dict, num_slots=10)
+    apply_offload_plan(model, device_mesh, expert_state_dict, num_slots=cache_slots)
 
     torch.distributed.barrier()
     logger.info(f"Inkling model loaded on device {device}")

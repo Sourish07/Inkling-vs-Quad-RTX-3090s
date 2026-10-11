@@ -6,19 +6,17 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
 from kernels import ExpertCache, GroupedExperts
-from kernels.paired_all_reduce import all_reduce
+from kernels.paired_all_reduce_triton import all_reduce
 
-from .model import (
-    MyInkling,
-    MyInklingExperts,
-)
+from .model import MyInkling, MyInklingExperts
 
 
 class OffloadedExperts(nn.Module):
     """
     Drop-in replacement for `MyInklingExperts` with a GPU-managed LRU expert cache in VRAM
     - Keep resident GPU experts and cache CPU experts in `num_slots` slots.
-    - Expects weights already sharded with EP with replicated inputs.
+    - Expects weights already sharded (whole experts for EP, slices of every expert
+      for TP) with replicated inputs.
     - Assumes mixed CPU/GPU storage and enough cache slots for one token's CPU experts.
     - Overflow prefill experts read mapped pinned host weights directly.
     - NVFP4 checkpoint: layer 2 is BF16; all other expert layers are quantized.
@@ -56,6 +54,7 @@ class OffloadedExperts(nn.Module):
         ]
         self.weight_names = [name for names in self.projection_names for name in names]
 
+        # 64 in EP & 256 in TP
         self.local_expert_ids = set(weights["down_proj"])
         device = torch.device("cuda", torch.cuda.current_device())
 
@@ -88,12 +87,15 @@ class OffloadedExperts(nn.Module):
         return final_hidden_states.to(hidden_states.dtype)
 
 
-def apply_ep_plan(
+def apply_offload_plan(
     model: MyInkling,
     device_mesh: DeviceMesh,
     expert_state_dict: dict[str, dict[int, torch.Tensor]],
     num_slots: int,
 ) -> MyInkling:
+    """
+    Replace every routed-expert module by `OffloadedExperts` over this rank's weights.
+    """
     for name, module in list(model.named_modules()):
         if isinstance(module, MyInklingExperts):
             # Isolate just the 6 weight banks (proj, scale, scale2) * (gate_up, down) for this layer

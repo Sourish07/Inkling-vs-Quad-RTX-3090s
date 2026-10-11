@@ -199,3 +199,5 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 - Also, changed number of pinned GPU experts from 24 to 20 to accomodate bs=16. (bs=1 is now slower...)
   - Will add dynamic configuration soon
   - Running at 17.22 tok/s
+
+## Notes on Flashpack + efficient checkpoint loading
