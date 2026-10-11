@@ -6,7 +6,13 @@ from torch import Tensor as T
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 
-from kernels import expert_copy, expert_gemm, expert_plan, expert_reduce
+from kernels import (
+    expert_bank_names,
+    expert_copy,
+    expert_gemm,
+    expert_plan,
+    expert_reduce,
+)
 from kernels.paired_all_reduce_triton import all_reduce
 
 from .model import MyInkling, MyInklingExperts
@@ -27,14 +33,17 @@ class OffloadedExperts(nn.Module):
     "routes" are defined as one (token, expert) pair!
     - (i.e. we're routing that token to that expert)
 
-    Example weights dict format:
+    Example weights dict format, keyed by global expert ID:
     weights = {
-        "gate_up_proj":        {0: packed_tensor, 1: packed_tensor},
-        "gate_up_proj_scale":  {0: scale_tensor,  1: scale_tensor},
-        "gate_up_proj_scale2": {0: scale2_tensor, 1: scale2_tensor},
-        "down_proj":           {0: packed_tensor, 1: packed_tensor},
-        "down_proj_scale":     {0: scale_tensor,  1: scale_tensor},
-        "down_proj_scale2":    {0: scale2_tensor, 1: scale2_tensor},
+        0: {
+            "gate_up_proj":        packed_tensor,
+            "gate_up_proj_scale":  scale_tensor,
+            "gate_up_proj_scale2": scale2_tensor,
+            "down_proj":           packed_tensor,
+            "down_proj_scale":     scale_tensor,
+            "down_proj_scale2":    scale2_tensor,
+        },
+        1: {...},
     }
     """
 
@@ -42,7 +51,7 @@ class OffloadedExperts(nn.Module):
         self,
         experts_module: MyInklingExperts,
         device_mesh: DeviceMesh,
-        weights: dict[str, dict[int, T]],
+        weights: dict[int, dict[str, T]],
         num_slots: int,
         layer_idx: int,
     ):
@@ -64,18 +73,12 @@ class OffloadedExperts(nn.Module):
         self.quantized = layer_idx != 2
         self.device = torch.device("cuda", torch.cuda.current_device())
 
-        # Bank order per expert; `expert_gemm` relies on it to find each projection.
-        suffixes = ("", "_scale", "_scale2") if self.quantized else ("",)
-        names = [
-            projection + suffix
-            for projection in ("gate_up_proj", "down_proj")
-            for suffix in suffixes
-        ]
-        self.stride = len(names)
+        names = expert_bank_names(self.quantized)
+        self.stride = len(names)  # 2 for bf16, 6 for nvfp4
 
-        ids = sorted(weights[names[0]])
+        ids: list[int] = sorted(weights)
         self.start = ids[0]
-        self.local = len(ids)
+        self.local = len(ids)  # 256 for TP, 64 for EP
         self.max_expert = ids[-1]
         assert ids == list(range(self.start, self.start + self.local))
         assert num_slots > 0
@@ -83,51 +86,73 @@ class OffloadedExperts(nn.Module):
         # GPU kernels read host weights by address, so they must be pinned.
         assert all(
             w.is_contiguous() and (w.is_cuda or w.is_pinned())
-            for name in names
-            for w in weights[name].values()
+            for expert in weights.values()
+            for w in expert.values()
         )
 
         # Cache slots and the addresses of every place an expert's weights can be.
-        first = [weights[name][ids[0]] for name in names]
+        first: list[T] = [weights[ids[0]][name] for name in names]
         self.banks = [
             torch.empty((num_slots, *w.shape), dtype=w.dtype, device=self.device)
             for w in first
         ]
-        self.sources = torch.tensor(
-            [[weights[name][e].data_ptr() for name in names] for e in ids],
+        """cache slots: VRAM copies of the offloaded experts currently cached on this rank"""
+
+        self.sources: Int[T, "num_experts num_banks"] = torch.tensor(
+            [[weights[e][name].data_ptr() for name in names] for e in ids],
             dtype=torch.int64,
             device=self.device,
         )
-        self.destinations = torch.tensor(
+        """list of data pointers to the num_experts x num_banks source weights"""
+
+        self.destinations: Int[T, "num_slots num_banks"] = torch.tensor(
             [[bank[s].data_ptr() for bank in self.banks] for s in range(num_slots)],
             dtype=torch.int64,
             device=self.device,
         )
-        self.resident = torch.tensor(
-            [weights[names[0]][e].is_cuda for e in ids],
+        """list of data pointers to the num_slots x num_banks destination banks"""
+
+        # never changes after initialization
+        self.resident: Int[T, " num_experts"] = torch.tensor(
+            [weights[e][names[0]].is_cuda for e in ids],
             dtype=torch.int32,
             device=self.device,
         )
+        """list of resident status for each expert (1 if permanently resident, 0 if offloaded)"""
+
         byte_sizes = [w.numel() * w.element_size() for w in first]
         assert all(size % 4 == 0 for size in byte_sizes)
+        # copy kernel moves data in 4 byte words
         self.sizes = tuple(size // 4 for size in byte_sizes)
 
         # LRU state, rewritten by the planner.
         int32 = {"dtype": torch.int32, "device": self.device}
-        self.slot_experts = torch.full((num_slots,), -1, **int32)
-        self.ages = torch.zeros(num_slots, **int32)
-        self.clock = torch.zeros((), **int32)
-        self.copy_experts = torch.empty(num_slots, **int32)
+        self.slot_experts: Int[T, " num_slots"] = torch.full((num_slots,), -1, **int32)
+        """which local expert is sitting in each cache slot right now (-1 if empty)"""
 
-        # Routing tables, rewritten by the planner and read by the projections:
-        # weight addresses by global expert ID (zero: not active on this rank), then
-        # the compacted active experts with their route counts and route rows.
-        self.pointers = torch.zeros(
+        self.ages: Int[T, " num_slots"] = torch.zeros(num_slots, **int32)
+        """clock value from the last time each slot was used; smallest gets evicted first"""
+
+        self.clock: Int[T, ""] = torch.zeros((), **int32)
+        """just a counter that ticks up by 1 every forward, used to stamp `ages`"""
+
+        # updated by the planner, read by the copy kernel
+        self.copy_experts: Int[T, " num_slots"] = torch.empty(num_slots, **int32)
+        """this forward's to-do list: which local expert to copy into each slot (-1 if none)"""
+
+        # can contain pointers to GPU resident experts, self.banks, or cpu-pinned memory (for prefill)
+        self.pointers: Int[T, " max_expert_plus_1*num_banks"] = torch.zeros(
             (self.max_expert + 1) * self.stride, dtype=torch.int64, device=self.device
         )
-        self.experts = torch.empty(self.local, **int32)
-        self.counts = torch.empty(self.local, **int32)
-        self.capacity = 0
+        """where to read each global expert's banks from this forward (0 if not active here)"""
+
+        self.experts: Int[T, " num_experts"] = torch.empty(self.local, **int32)
+        """global IDs of the experts that got routed to this forward, packed at the front (-1 after)"""
+
+        self.counts: Int[T, " num_experts"] = torch.empty(self.local, **int32)
+        """how many routes each of those active experts got, same order as `experts` (0 after)"""
+
+        self.capacity = 0  # updated by _reserve
 
     def _reserve(self, routes: int) -> None:
         """
@@ -227,6 +252,7 @@ class OffloadedExperts(nn.Module):
                 top_k,
                 projection,
                 self.quantized,
+                self.stride,
                 block_m,
                 block_n,
                 block_k,
@@ -277,7 +303,7 @@ class OffloadedExperts(nn.Module):
 def apply_offload_plan(
     model: MyInkling,
     device_mesh: DeviceMesh,
-    expert_state_dict: dict[str, dict[int, torch.Tensor]],
+    expert_state_dict: dict[str, dict[int, dict[str, torch.Tensor]]],
     num_slots: int,
 ) -> MyInkling:
     """
@@ -285,20 +311,14 @@ def apply_offload_plan(
     """
     for name, module in list(model.named_modules()):
         if isinstance(module, MyInklingExperts):
-            # Isolate just the 6 weight banks (proj, scale, scale2) * (gate_up, down) for this layer
-            # the "per-expert" dictionaries (ex. {0: packed_tensor, 1: packed_tensor}) are
-            # prebuilt from checkpoint loader
-            weights = {
-                key.removeprefix(f"{name}."): bank
-                for key, bank in expert_state_dict.items()
-                if key.startswith(f"{name}.")
-            }
+            # The checkpoint loader prebuilds this layer's per-expert dictionaries of
+            # weight banks: (proj, scale, scale2) * (gate_up, down).
             model.set_submodule(
                 name,
                 OffloadedExperts(
                     module,
                     device_mesh,
-                    weights,
+                    expert_state_dict[name],
                     num_slots,
                     layer_idx=int(name.split(".")[-3]),
                 ),

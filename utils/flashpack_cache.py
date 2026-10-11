@@ -100,12 +100,13 @@ def load_non_expert_state_dict(rank, device):
 
 def load_expert_state_dict(rank, device, gpu_experts_per_rank, full_tp=False):
     """
-    Read this rank's experts as {weight_name: {global_expert_id: tensor}}.
+    Read this rank's experts as {experts_module: {global_expert_id: {bank: tensor}}}.
 
     full_tp reads the pack holding this rank's slice of every expert instead of
     its share of whole experts. The first gpu_experts_per_rank experts of the
-    shard go to device; the rest each get their own pinned allocation. NVFP4 weights stay packed, with their
-    _scale and _scale2 banks; gate/up rows stay interleaved as in the checkpoint.
+    shard go to device; the rest each get their own pinned allocation. NVFP4
+    weights stay packed, with their _scale and _scale2 banks; gate/up rows stay
+    interleaved as in the checkpoint.
     """
     prefix = "experts-tp" if full_tp else "experts"
     path = FLASHPACK_DIR / f"{prefix}-rank-{rank}.flashpack"
@@ -129,8 +130,8 @@ def load_expert_state_dict(rank, device, gpu_experts_per_rank, full_tp=False):
             else:
                 value = torch.empty(length, dtype=torch.uint8, pin_memory=True)
             fill(start, value)
-            name = record["name"].rsplit("/", 1)[0]
-            state.setdefault(name, {})[expert_id(record)] = value.view(dtype).reshape(
-                record["shape"]
-            )
+            # Records are named "<experts module>.<bank>/<expert id>".
+            module, _, bank = record["name"].rsplit("/", 1)[0].rpartition(".")
+            expert = state.setdefault(module, {}).setdefault(expert_id(record), {})
+            expert[bank] = value.view(dtype).reshape(record["shape"])
     return state

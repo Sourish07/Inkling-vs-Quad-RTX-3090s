@@ -6,6 +6,22 @@ import triton
 import triton.language as tl
 
 
+def expert_bank_names(quantized: bool) -> list[str]:
+    """
+    Name one expert's weight banks in pointer-table order.
+
+    Gate/up comes first, then down, each followed by its NVFP4 scale banks when
+    quantized. `expert_gemm` finds a projection's banks by this order, and the
+    length is the pointer-table stride per expert.
+    """
+    suffixes = ("", "_scale", "_scale2") if quantized else ("",)
+    return [
+        projection + suffix
+        for projection in ("gate_up_proj", "down_proj")
+        for suffix in suffixes
+    ]
+
+
 @triton.jit
 def expert_gemm(
     X,
@@ -20,6 +36,7 @@ def expert_gemm(
     TOP_K: tl.constexpr,
     PROJECTION: tl.constexpr,
     QUANTIZED: tl.constexpr,
+    STRIDE: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
@@ -39,9 +56,8 @@ def expert_gemm(
 
     if row_tile_number * BM < count:
         expert = tl.load(Experts + group)
-        pointer_stride = 6 if QUANTIZED else 2
-        projection_stride = 3 if QUANTIZED else 1
-        pointers = Pointers + expert * pointer_stride + PROJECTION * projection_stride
+        # Each projection owns half of an expert's STRIDE banks.
+        pointers = Pointers + expert * STRIDE + PROJECTION * (STRIDE // 2)
         dtype = X.dtype.element_ty
         weight_dtype = tl.uint8 if QUANTIZED else dtype
         weight = tl.load(pointers).to(tl.pointer_type(weight_dtype))

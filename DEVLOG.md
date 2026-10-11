@@ -201,3 +201,11 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
   - Running at 17.22 tok/s
 
 ## Notes on Flashpack + efficient checkpoint loading
+- Will get back to this
+
+## 13. Switching experts from EP to TP
+
+- I originally added EP as an exercise, but after benchmarking TP is significantly faster (for bs=1)
+- Currently running at ~28.14 tok/s!
+- Heavy refactoring of `offloaded_experts.py`
+  - Consolidated all various expert classes; one class is responsible for managing cache, copying experts, & performing the GEMMs
