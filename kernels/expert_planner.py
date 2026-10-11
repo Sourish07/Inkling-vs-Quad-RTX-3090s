@@ -1,5 +1,6 @@
 """
-GPU cache planning and onload from CUDA-mapped pinned checkpoint tensors.
+Expert routing, GPU cache planning and onload from CUDA-mapped pinned checkpoint
+tensors.
 """
 
 import triton
