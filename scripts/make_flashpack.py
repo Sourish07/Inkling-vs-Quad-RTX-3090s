@@ -72,8 +72,8 @@ def main(
         for handle, key in _llm_tensors(checkpoint_dir, experts=experts):
             # Expert banks are only renamed, so they stay lazy until sliced below.
             lazy = handle.get_slice(key)
-            tensor = lazy if experts else handle.get_tensor(key)
-            converted = convert_checkpoint_tensors({key: tensor}, packed_experts=True)
+            source = lazy if experts else handle.get_tensor(key)
+            converted = convert_checkpoint_tensors({key: source}, packed_experts=True)
             for name, tensor in converted.items():
                 if not experts and name not in templates:
                     continue

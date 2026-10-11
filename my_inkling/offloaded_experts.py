@@ -13,7 +13,7 @@ from kernels import (
     expert_plan,
     expert_reduce,
 )
-from kernels.paired_all_reduce_triton import all_reduce
+from kernels.paired_all_reduce import all_reduce
 
 from .model import MyInkling, MyInklingExperts
 
@@ -259,7 +259,7 @@ class OffloadedExperts(nn.Module):
             )
 
         # For EP, we're summing across just this rank's experts
-        # For TP, we're summing across all experts, albiet just a quarter of their features
+        # For TP, we're summing across all experts, albeit just a quarter of their features
         expert_reduce[(x.shape[0], triton.cdiv(self.hidden_dim, 256))](
             self.down,
             indices,

@@ -32,7 +32,7 @@ hf_repo = "thinkingmachines/Inkling-Small-NVFP4"
 def main(
     profile: bool = False,
     log2_max_new_tokens: int = 7,
-    full_tp: bool = False,
+    full_tp: bool = True,
     gpu_experts_per_rank: int | None = None,
     cache_slots: int | None = None,
     cuda_graph: bool = True,
