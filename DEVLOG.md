@@ -209,6 +209,7 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 - Currently running at ~28.14 tok/s!
 - Heavy refactoring of `offloaded_experts.py`
   - Consolidated all various expert classes; one class is responsible for managing cache, copying experts, & performing the GEMMs
+  - It's interesting that `OffloadedExperts` is the same between TP & EP. TP just divides the intermediate dim value and EP just passes in a quarter of the experts. The class doesn't have any specific logic here.
 - Need all-reduce after using EP or TP (for experts)!
   - It's almost "coincidental" that EP & TP both require an all-reduce
   - For EP, a token's routed experts are distributed, so we need to sum the outputs
