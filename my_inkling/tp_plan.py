@@ -170,16 +170,22 @@ class _HeadParallelConv1d(nn.Conv1d):
 
 
 def apply_tp_plan(
-    model: MyInkling, config: InklingConfig, device_mesh: DeviceMesh
+    model: MyInkling,
+    config: InklingConfig,
+    device_mesh: DeviceMesh,
+    full_tp: bool = False,
 ) -> MyInkling:
     """
     Install local shards before checkpoint loading; update head counts for caches.
+    `full_tp` also slices every routed expert; `apply_offload_plan` installs them
+    after loading.
     """
     tp_size = device_mesh.size()
     if tp_size == 1:
         return model
     tower = model.model.language_model
     tower.embed_tokens = _VocabParallelEmbedding(tower.embed_tokens, device_mesh)
+
     for layer in tower.layers:
         attention: MyInklingAttention = layer.self_attn
         for name in ("q_proj", "k_proj", "v_proj", "r_proj"):
@@ -204,6 +210,9 @@ def apply_tp_plan(
             layer.mlp.shared_experts = _TPSharedExperts(
                 layer.mlp.shared_experts, device_mesh
             )
+            if full_tp:
+                # `OffloadedExperts` sizes its kernels from this once weights load.
+                layer.mlp.experts.intermediate_dim //= tp_size
 
     model.lm_head = ColumnLinear(model.lm_head, device_mesh, sync_after_forward=True)
 
