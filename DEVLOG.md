@@ -209,3 +209,10 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
 - Currently running at ~28.14 tok/s!
 - Heavy refactoring of `offloaded_experts.py`
   - Consolidated all various expert classes; one class is responsible for managing cache, copying experts, & performing the GEMMs
+- Need all-reduce after using EP or TP (for experts)!
+  - It's almost "coincidental" that EP & TP both require an all-reduce
+  - For EP, a token's routed experts are distributed, so we need to sum the outputs
+      - We're summing across experts
+      - If a token wasn't routed to a rank, its column will remain zero from the torch.zeros_like() on that rank
+  - For TP, a token's routed experts are sliced, so we need RowLinear's all-reduce
+      - We're summing across experts' features

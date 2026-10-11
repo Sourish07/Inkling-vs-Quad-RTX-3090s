@@ -284,15 +284,7 @@ class OffloadedExperts(nn.Module):
         self._plan(top_k_index)
         self._project(hidden_states, top_k_index, top_k_weights, final_hidden_states)
 
-        """
-        All-reduce required for both EP & TP!
-        - For EP, a token's routed experts are distributed, so we need to sum the outputs
-            - We're summing across experts
-            - If a token wasn't routed to a rank, its column will remain zero from the torch.zeros_like()
-        - For TP, a token's routed experts are sliced, so we need RowLinear's all-reduce
-            - We're summing across experts' features
-        (It's almost "coincidental" that EP & TP both require an all-reduce here)
-        """
+        # All-reduce required for both EP & TP! See DEVLOG.md
         final_hidden_states = all_reduce(
             final_hidden_states, self.device_mesh.get_group()
         )
