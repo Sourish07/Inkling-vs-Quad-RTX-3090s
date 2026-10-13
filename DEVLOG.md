@@ -243,3 +243,8 @@ Limitations:
   - Tune optimal number of GPU resident experts and LRU cache slots (esp based on bs)
 
 - After rerunning `greedy_placement.py` with `num_promote=4` instead of 64, speed went up to 30.15 tok/s!
+
+## 15. Custom GEMV cuda kernel
+
+- one NVFP4/BF16 matrix-vector product per route, down projection and weighted sum fused
+- Running at ~71.24 tok/s
