@@ -247,4 +247,5 @@ Limitations:
 ## 15. Custom GEMV cuda kernel
 
 - one NVFP4/BF16 matrix-vector product per route, down projection and weighted sum fused
+- Currently, we're jit-compiling the kernels. Could use pybind, but since I'm going to port to CuTe, not worth setting up. No speed gains anyways.
 - Running at ~71.24 tok/s
