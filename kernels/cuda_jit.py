@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from cuda.bindings import driver, nvrtc
+from cuda.bindings import driver, nvrtc  # ty: ignore[unresolved-import]
 
 _SOURCES = Path(__file__).resolve().parent
 

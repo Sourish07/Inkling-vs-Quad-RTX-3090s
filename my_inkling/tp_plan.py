@@ -37,9 +37,8 @@ def _shard_parameter(
         .clone()
         .contiguous()
     )
-    module.register_parameter(
-        name, nn.Parameter(local, requires_grad=weight.requires_grad)
-    )
+    # Inference only; DLPack refuses tensors that require grad
+    module.register_parameter(name, nn.Parameter(local, requires_grad=False))
     if not hasattr(module, "_tp_shard_dims"):
         module._tp_shard_dims = {}
     # Used to determine which dimension to shard along when loading checkpoints.
