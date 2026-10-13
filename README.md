@@ -4,7 +4,7 @@ Optimizing [Inkling Small](https://huggingface.co/thinkingmachines/Inkling-Small
 
 The challenge: Non-expert weights are 15.38 GiB (9.7%) but the expert weights are 143.62 GiB (90.3%). This means the experts don't fit completely in host memory or sharded across GPUs. **I keep a subset of experts in VRAM, store the rest in pinned host memory, and stream experts to GPUs on demand.** CPU-resident experts are cached in VRAM and are evicted via LRU policy to avoid repeated transfers.
 
-Result: ~0.10 tok/s → 18.14 tok/s (~181× improvement) on 4× RTX 3090s.
+Result: ~0.10 tok/s → 71.24 tok/s (~712× improvement) on 4× RTX 3090s.
 
 ### Benchmarking
 
@@ -23,7 +23,10 @@ List of optimizations (so far!):
 | Fuse Q/K/V/relative projections + simplify attention prep | 11.22 tok/s |
 | Fuse normalization, short convolutions, and cache updates | 14.77 tok/s |
 | CUDA Graph replay for decode | 17.22 tok/s |
-| Paired NVLink/PCIe tensor-parallel reductions | **18.14 tok/s** |
+| Paired NVLink/PCIe tensor-parallel reductions | 18.14 tok/s |
+| Switch experts from expert parallelism to tensor parallelism | 28.14 tok/s |
+| Greedy placement of GPU-resident experts | 30.15 tok/s |
+| Custom GEMV CUDA kernel | **71.24 tok/s** |
 
 Notes:
 - All calculations are done with conc=1 for now. Warmup & prefill are excluded.
@@ -31,9 +34,9 @@ Notes:
   - Peak BF16 flops for RTX 3090 (assuming stock boost clock speed): 71 TFLOP/s
   - Number of active parameters in forward pass: 12B
   - Number of FLOPs in decode forward pass: 2 * 12B = 24 GFLOPs = 0.024 TFLOPs
-  - 18.14 tok/s = ~55 ms per token
-  - 0.024 TFLOPs / 0.055 seconds = 0.436 TFLOP/s
-  - MFU = 0.436 TFLOP/s / (4 * 71 TFLOP/s) = 0.00153 -> **0.153% MFU**
+  - 71.24 tok/s = ~14.04 ms per token
+  - 0.024 TFLOPs / 0.01404 seconds = 1.709 TFLOP/s
+  - MFU = 1.709 TFLOP/s / (4 * 71 TFLOP/s) = 0.00602 -> **0.602% MFU**
   - Not taking into account cost of dequantizing FP4 weights & applying scales
 
 ### Interesting things I learned
@@ -60,7 +63,6 @@ For the NVFP4 checkpoint, all routed experts except layer 2 are quantized to NVF
 ### Future features to come!
 
 - Add vision & audio towers
-- Shard experts with TP instead of EP (and benchmark)
 - Batched decode
 - Custom GPU-pinned expert selection
 - Vary num pinned experts by layers
