@@ -253,7 +253,7 @@ Limitations:
 ## 16. Keeping embedding table in pinned host memory
 
 - This one is also a little unexpected... Didn't know if it'd work
-- Essentially, we added a custom CUDA kernel to merge the embedding table lookup into a single kernel:
+- Essentially, we added a custom CuTe kernel to merge the embedding table lookup into a single kernel:
 ```python
 local_ids = input_ids - self.vocab_start
 outside = (local_ids < 0) | (local_ids >= self.num_embeddings)
