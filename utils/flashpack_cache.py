@@ -127,13 +127,14 @@ def load_expert_state_dict(rank, device, gpu_experts_per_rank, full_tp=False):
     first_expert_id = min(map(expert_id, records))
     num_layers = len(set(map(layer_id, records)))
 
-    placement_file = "/home/sourish/Inkling-vs-Quad-RTX-3090s/placement.json"
+    placement_file = Path(__file__).parent.parent / "placement.json"
     if full_tp and os.path.exists(placement_file):
         with open(placement_file) as f:
             placement_map = json.load(f)
             for key in placement_map:
                 placement_map[key] = set(placement_map[key][:gpu_experts_per_rank])
     else:
+        logger.info(f"Using default, naive placement. Keeping first {gpu_experts_per_rank} experts resident.")
         # placement_map: dict[int, list[int]]
         # maps layer id to the list of expert ids to keep resident on GPU
         placement_map = {
