@@ -146,7 +146,8 @@ def load_expert_state_dict(rank, device, gpu_experts_per_rank, full_tp=False):
     with _direct_reader(path) as fill:
         for record in sorted(records, key=lambda r: span(r)[0]):
             start, length, dtype = span(record)
-            if expert_id(record) in placement_map[layer_id(record)]:
+            layer = layer_id(record)
+            if layer == "2" or expert_id(record) in placement_map[layer]:
                 value = torch.empty(length, dtype=torch.uint8, device=device)
             else:
                 value = torch.empty(length, dtype=torch.uint8, pin_memory=True)

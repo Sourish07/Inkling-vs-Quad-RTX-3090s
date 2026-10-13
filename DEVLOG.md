@@ -226,9 +226,18 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
   - If we had enough space, we would've just pinned all experts in CPU memory and just used a simple LRU cache in GPU VRAM; No GPU resident necessary
 - First approach: greedily feed expert routing data through a mock model to calculate which experts result in the most copies; Add them to GPU resident set
   - Getting ~30.04 tok/s!
+- The more GPU resident experts we have, the less pinned host memory is required
+- The more GPU resident experts & LRU cache slots we have, the more GPU VRAM is required
+
+Limitations:
+- The expert routing data was collected for "machine learning" related Q/A prompts.
+  - However, a "write me a poem about nature" also got the same speed...
+- This machine's GPUs can hold a total of 116 experts in cache (i.e. resident experts + LRU cache slots) at bs=1
+  - Settled on 64 GPU resident experts and 52 LRU cache slots
 
 - Future directions
   - Global cache; So different layers have different number of resident experts
   - Or... Just figure out which layers have the most copies overall (i.e. experts are always uniformly chosen, so LRU doesn't help and keep them resident. Then, just use simple LRU for other layers, up until CPU memory permits)
   - Speculative prefetching of experts
   - `Fast Inference of Mixture-of-Experts Language Models with Offloading` paper
+  - Tune optimal number of GPU resident experts and LRU cache slots (esp based on bs)

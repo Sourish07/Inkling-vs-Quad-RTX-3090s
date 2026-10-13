@@ -81,7 +81,11 @@ class OffloadedExperts(nn.Module):
         self.local = len(ids)  # 256 for TP, 64 for EP
         self.max_expert = ids[-1]
         assert ids == list(range(self.start, self.start + self.local))
-        assert num_slots > 0
+        # A layer whose experts are all resident never copies: no cache slots.
+        if not self.quantized:
+            num_slots = 0
+        else:
+            assert num_slots > 0
         self.num_slots = num_slots
         # GPU kernels read host weights by address, so they must be pinned.
         assert all(
@@ -197,10 +201,12 @@ class OffloadedExperts(nn.Module):
             routes,
             self.capacity,
             triton.next_power_of_2(self.local),
-            triton.next_power_of_2(self.num_slots),
+            triton.next_power_of_2(max(self.num_slots, 1)),
             triton.next_power_of_2(routes),
             num_warps=4,
         )
+        if self.num_slots == 0:
+            return
         expert_copy[(128, self.num_slots)](
             self.sources,
             self.destinations,
