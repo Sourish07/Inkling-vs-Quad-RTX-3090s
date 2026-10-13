@@ -241,3 +241,5 @@ Limitations:
   - Speculative prefetching of experts
   - `Fast Inference of Mixture-of-Experts Language Models with Offloading` paper
   - Tune optimal number of GPU resident experts and LRU cache slots (esp based on bs)
+
+- After rerunning `greedy_placement.py` with `num_promote=4` instead of 64, speed went up to 30.15 tok/s!
