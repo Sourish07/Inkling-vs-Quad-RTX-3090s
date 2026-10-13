@@ -12,10 +12,14 @@ from kernels import (
     expert_gemm,
     expert_plan,
     expert_reduce,
+    routed_decode,
 )
 from kernels.paired_all_reduce import all_reduce
 
 from .model import MyInkling, MyInklingExperts
+
+# Up to this many tokens, each route runs its own matrix-vector product.
+MATVEC_TOKENS = 8
 
 
 class OffloadedExperts(nn.Module):
@@ -230,6 +234,18 @@ class OffloadedExperts(nn.Module):
         Reads the tables `_plan` just filled, so the number of launches is fixed per
         layer and does not depend on how many experts are active.
         """
+        if x.shape[0] <= MATVEC_TOKENS:
+            routed_decode(
+                x,
+                indices,
+                weights,
+                self.pointers,
+                self.activated,
+                output,
+                self.max_expert,
+                self.quantized,
+            )
+            return
         routes = indices.numel()  # num_tokens * top_k
         top_k = indices.shape[1]
         block_m = 16
