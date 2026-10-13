@@ -217,3 +217,18 @@ hidden_states = self.conv1d(hidden_states)[..., :seq_len]
       - If a token wasn't routed to a rank, its column will remain zero from the torch.zeros_like() on that rank
   - For TP, a token's routed experts are sliced, so we need RowLinear's all-reduce
       - We're summing across experts' features
+
+## 14. Optimizing placement algorithm
+
+- Originally, just the first 80 experts would be resident on the GPU, with the remaining VRAM dedicated to LRU cache
+- I want to improve choosing which experts to keep resident on GPU
+- The problem is that the experts we choose must always remain resident because host memory doesn't have enough space (because pinned memory) to store CPU copy of all experts
+  - If we had enough space, we would've just pinned all experts in CPU memory and just used a simple LRU cache in GPU VRAM; No GPU resident necessary
+- First approach: greedily feed expert routing data through a mock model to calculate which experts result in the most copies; Add them to GPU resident set
+  - Getting ~30.04 tok/s!
+
+- Future directions
+  - Global cache; So different layers have different number of resident experts
+  - Or... Just figure out which layers have the most copies overall (i.e. experts are always uniformly chosen, so LRU doesn't help and keep them resident. Then, just use simple LRU for other layers, up until CPU memory permits)
+  - Speculative prefetching of experts
+  - `Fast Inference of Mixture-of-Experts Language Models with Offloading` paper

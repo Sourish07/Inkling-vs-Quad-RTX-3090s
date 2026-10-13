@@ -2,6 +2,7 @@
 Load the per-rank FlashPack files written by scripts/make_flashpack.py.
 """
 
+import json
 import os
 from contextlib import contextmanager
 from pathlib import Path
@@ -120,12 +121,31 @@ def load_expert_state_dict(rank, device, gpu_experts_per_rank, full_tp=False):
     def expert_id(record):
         return int(record["name"].rsplit("/", 1)[1])
 
-    first = min(map(expert_id, records))
+    def layer_id(record):
+        return record["name"].split(".layers.", 1)[1].split(".", 1)[0]
+
+    first_expert_id = min(map(expert_id, records))
+    num_layers = len(set(map(layer_id, records)))
+
+    placement_file = "/home/sourish/Inkling-vs-Quad-RTX-3090s/placement.json"
+    if full_tp and os.path.exists(placement_file):
+        with open(placement_file) as f:
+            placement_map = json.load(f)
+            for key in placement_map:
+                placement_map[key] = set(placement_map[key][:gpu_experts_per_rank])
+    else:
+        # placement_map: dict[int, list[int]]
+        # maps layer id to the list of expert ids to keep resident on GPU
+        placement_map = {
+            str(i): list(range(first_expert_id, first_expert_id + gpu_experts_per_rank))
+            for i in range(2, num_layers + 2)
+        }
+
     state = {}
     with _direct_reader(path) as fill:
         for record in sorted(records, key=lambda r: span(r)[0]):
             start, length, dtype = span(record)
-            if expert_id(record) - first < gpu_experts_per_rank:
+            if expert_id(record) in placement_map[layer_id(record)]:
                 value = torch.empty(length, dtype=torch.uint8, device=device)
             else:
                 value = torch.empty(length, dtype=torch.uint8, pin_memory=True)
