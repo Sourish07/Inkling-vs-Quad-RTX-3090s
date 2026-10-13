@@ -2,6 +2,7 @@
 Load the per-rank FlashPack files written by scripts/make_flashpack.py.
 """
 
+import json
 import os
 from contextlib import contextmanager
 from pathlib import Path
@@ -103,9 +104,9 @@ def load_expert_state_dict(rank, device, gpu_experts_per_rank, full_tp=False):
     Read this rank's experts as {experts_module: {global_expert_id: {bank: tensor}}}.
 
     full_tp reads the pack holding this rank's slice of every expert instead of
-    its share of whole experts. The first gpu_experts_per_rank experts of the
-    shard go to device; the rest each get their own pinned allocation. NVFP4
-    weights stay packed, with their _scale and _scale2 banks; gate/up rows stay
+    its share of whole experts.
+
+    NVFP4 weights stay packed, with their _scale and _scale2 banks; gate/up rows stay
     interleaved as in the checkpoint.
     """
     prefix = "experts-tp" if full_tp else "experts"
@@ -120,12 +121,33 @@ def load_expert_state_dict(rank, device, gpu_experts_per_rank, full_tp=False):
     def expert_id(record):
         return int(record["name"].rsplit("/", 1)[1])
 
-    first = min(map(expert_id, records))
+    def layer_id(record):
+        return record["name"].split(".layers.", 1)[1].split(".", 1)[0]
+
+    first_expert_id = min(map(expert_id, records))
+    num_layers = len(set(map(layer_id, records)))
+
+    placement_file = Path(__file__).parent.parent / "placement.json"
+    if full_tp and os.path.exists(placement_file):
+        with open(placement_file) as f:
+            placement_map = json.load(f)
+            for key in placement_map:
+                placement_map[key] = set(placement_map[key][:gpu_experts_per_rank])
+    else:
+        logger.info(f"Using default, naive placement. Keeping first {gpu_experts_per_rank} experts resident.")
+        # placement_map: dict[int, list[int]]
+        # maps layer id to the list of expert ids to keep resident on GPU
+        placement_map = {
+            str(i): list(range(first_expert_id, first_expert_id + gpu_experts_per_rank))
+            for i in range(2, num_layers + 2)
+        }
+
     state = {}
     with _direct_reader(path) as fill:
         for record in sorted(records, key=lambda r: span(r)[0]):
             start, length, dtype = span(record)
-            if expert_id(record) - first < gpu_experts_per_rank:
+            layer = layer_id(record)
+            if layer == "2" or expert_id(record) in placement_map[layer]:
                 value = torch.empty(length, dtype=torch.uint8, device=device)
             else:
                 value = torch.empty(length, dtype=torch.uint8, pin_memory=True)
