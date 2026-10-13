@@ -266,3 +266,4 @@ embeddings.masked_fill_(outside.unsqueeze(-1), 0)
 - Now, if we keep the embedding table in pinned host memory, it slows down to 3.264us per token
   - Above three timings were with profiling overhead btw
 - But... we have around 1.57 GiB of VRAM (393 MiB per rank) freed up! This means we can increase the cache size by three slots
+- Running at ~71.40 tok/s (very small gain, maybe within noise band? Regardless a 2us increase in embedding lookup is negligible so I'd rather have a larger cache)
