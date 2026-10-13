@@ -58,10 +58,11 @@ def main(
     setup_rank_aware_logger()
     device_mesh = get_device_mesh(num_dimensions=1)
 
+    # 20 & 10 aren't tuned for EP
     if gpu_experts_per_rank is None:
-        gpu_experts_per_rank = 80 if full_tp else 20
+        gpu_experts_per_rank = 64 if full_tp else 20
     if cache_slots is None:
-        cache_slots = 40 if full_tp else 10
+        cache_slots = 52 if full_tp else 10
 
     tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
         hf_repo, trust_remote_code=True

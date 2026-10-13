@@ -104,9 +104,9 @@ def load_expert_state_dict(rank, device, gpu_experts_per_rank, full_tp=False):
     Read this rank's experts as {experts_module: {global_expert_id: {bank: tensor}}}.
 
     full_tp reads the pack holding this rank's slice of every expert instead of
-    its share of whole experts. The first gpu_experts_per_rank experts of the
-    shard go to device; the rest each get their own pinned allocation. NVFP4
-    weights stay packed, with their _scale and _scale2 banks; gate/up rows stay
+    its share of whole experts.
+
+    NVFP4 weights stay packed, with their _scale and _scale2 banks; gate/up rows stay
     interleaved as in the checkpoint.
     """
     prefix = "experts-tp" if full_tp else "experts"

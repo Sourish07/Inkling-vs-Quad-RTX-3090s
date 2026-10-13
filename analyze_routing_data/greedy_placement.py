@@ -1,12 +1,11 @@
-"""Replay the saved responses through an LRU expert cache and count the copies.
+"""
+Replay the saved responses through an LRU expert cache and count the copies.
 
-Each layer caches ``slots`` of its experts on the GPUs; no expert is resident.
-A routed expert that is not cached is a copy from host memory, and it evicts
-the least recently used one.
-The requests are served in order, one at a time, and the cache carries over
-from one request to the next.
+Greedily prompt `num_promote` experts with most copies to "resident" 
+and then rerun all requests to count the copies again. Repeat until all 256 experts
+are ranked.
 
-Run with ``python measure_policy.py --slots X`` from this directory.
+Run with `uv run analyze_routing_data/greedy_placement.py --cache-size 56`.
 """
 
 import base64
@@ -18,7 +17,7 @@ from random import shuffle
 
 import numpy as np
 import tyro
-from tqdm import tqdm
+from tqdm import trange
 
 random.seed(42)
 
@@ -74,12 +73,15 @@ class LRU:
             lru.popitem(last=False)  # FIFO
 
 
-def main(cache_size: int, num_promote: int = 64, responses: Path = RESPONSES) -> None:
+def main(cache_size: int, num_promote: int = 4, responses: Path = RESPONSES) -> None:
     """
     Args:
-        slots: Cached experts per layer.
+        cache_size: Number of experts to cache.
+        num_promote: Number of experts to promote to "resident" per iteration.
         responses: Directory of saved responses.
     """
+    assert NUM_EXPERTS % num_promote == 0
+
     files = {}
     for file in responses.glob("*.json"):
         response = json.loads(file.read_text())["response"]
@@ -88,13 +90,13 @@ def main(cache_size: int, num_promote: int = 64, responses: Path = RESPONSES) ->
 
     resident_experts = [OrderedDict() for _ in range(NUM_LAYERS)]
 
-    for iter in range(NUM_EXPERTS // num_promote):
+    for _ in trange(NUM_EXPERTS // num_promote):
         lru = LRU(cache_size, resident_experts)
 
         keys = list(files.keys())
         shuffle(keys)
 
-        for file in tqdm(keys):
+        for file in keys:
             experts = files[file]
             # experts is (seq_len, num_layers, top_k)
             experts = experts[:, 2:, :]  # layers 0 & 1 are dense layers
@@ -111,7 +113,8 @@ def main(cache_size: int, num_promote: int = 64, responses: Path = RESPONSES) ->
                 most_copied_expert, count = sorted_pairs[p]
                 resident_experts[layer][most_copied_expert] = None
 
-    with open("placement.json", "w") as f:
+    path = Path(__file__).parent.parent / "placement.json"
+    with open(path, "w") as f:
         rows = [
             f'    "{i}": {json.dumps(list(resident_experts[i]))}'
             for i in range(NUM_LAYERS)
