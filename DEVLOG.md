@@ -249,3 +249,20 @@ Limitations:
 - one NVFP4/BF16 matrix-vector product per route, down projection and weighted sum fused
 - Currently, we're jit-compiling the kernels. Could use pybind, but since I'm going to port to CuTe, not worth setting up. No speed gains anyways.
 - Running at ~71.24 tok/s
+
+## 16. Keeping embedding table in pinned host memory
+
+- This one is also a little unexpected... Didn't know if it'd work
+- Essentially, we added a custom CUDA kernel to merge the embedding table lookup into a single kernel:
+```python
+local_ids = input_ids - self.vocab_start
+outside = (local_ids < 0) | (local_ids >= self.num_embeddings)
+embeddings = F.embedding(local_ids.masked_fill(outside, 0), self.weight)
+embeddings.masked_fill_(outside.unsqueeze(-1), 0)
+```
+- These lines would take 12.488us per token (under graph replay)
+    - 8 GPU ops (one is a D to D copy)
+- Merged kernel now takes 1.76us per token
+- Now, if we keep the embedding table in pinned host memory, it slows down to 3.264us per token
+  - Above three timings were with profiling overhead btw
+- But... we have around 1.57 GiB of VRAM (393 MiB per rank) freed up! This means we can increase the cache size by three slots

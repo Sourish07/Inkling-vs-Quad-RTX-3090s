@@ -9,8 +9,8 @@ from jaxtyping import Int
 from torch import Tensor as T
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.nn import functional as F
 
+from kernels.embedding import embed_rows
 from kernels.paired_all_reduce import all_reduce
 
 from .model import (
@@ -115,10 +115,9 @@ class _VocabParallelEmbedding(MyInklingNormedEmbedding):
         self.device_mesh = device_mesh
 
     def forward(self, input_ids: Int[T, "bs s"]) -> Fp[T, "bs s d"]:
-        local_ids = input_ids - self.vocab_start
-        outside = (local_ids < 0) | (local_ids >= self.num_embeddings)
-        embeddings = F.embedding(local_ids.masked_fill(outside, 0), self.weight)
-        embeddings.masked_fill_(outside.unsqueeze(-1), 0)
+        # A forward reads one 8 KiB row per token, so the table can sit in pinned
+        # host memory and leave its VRAM to the expert cache; one launch either way.
+        embeddings = embed_rows(input_ids, self.weight, self.vocab_start)
 
         embeddings = all_reduce(embeddings, self.device_mesh.get_group())
 

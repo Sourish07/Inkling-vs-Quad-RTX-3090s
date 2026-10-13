@@ -37,6 +37,7 @@ def main(
     cache_slots: int | None = None,
     cuda_graph: bool = True,
     batch_size: int = 1,
+    pin_embedding: bool = True,
 ) -> None:
     """Generate from the sharded Inkling model and report decode throughput.
 
@@ -52,6 +53,8 @@ def main(
             Defaults to 10 whole experts, or 40 slices with full_tp.
         cuda_graph: Replay decode steps from a captured CUDA graph; disable to run
             them eagerly.
+        pin_embedding: Keep the embedding table in pinned CPU RAM instead of VRAM
+            (tensor-parallel runs only).
     """
     device, local_rank = setup_ddp_local()
     world_size = get_world_size()
@@ -62,7 +65,7 @@ def main(
     if gpu_experts_per_rank is None:
         gpu_experts_per_rank = 64 if full_tp else 20
     if cache_slots is None:
-        cache_slots = 52 if full_tp else 10
+        cache_slots = 55 if full_tp else 10
 
     tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
         hf_repo, trust_remote_code=True
@@ -78,7 +81,11 @@ def main(
 
     logger.info("Loading state dict into sharded model")
     with Timer("Non-expert checkpoint loading"):
-        non_expert_state_dict = load_non_expert_state_dict(local_rank, device)
+        # The vocab-parallel embedding can read its table from pinned host memory.
+        pinned = ("embed_tokens.weight",) if pin_embedding and world_size > 1 else ()
+        non_expert_state_dict = load_non_expert_state_dict(
+            local_rank, device, pinned=pinned
+        )
     missing, unexpected = model.load_state_dict(
         non_expert_state_dict, strict=False, assign=True
     )
