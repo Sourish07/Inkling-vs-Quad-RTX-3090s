@@ -38,8 +38,38 @@ def expert_plan(
     the GPU means the host never downloads (from GPU) expert IDs (a forced sync) and never
     rebuilds or uploads the pointer table.
 
-    Params:
-        Clock: just an int that gets incremented every time the kernel runs, used to update Ages
+    (num_weight_tensors is 6 for nvfp4 because gate_up_proj, down_proj, and two scale tensors per proj matrix)
+
+    Read-only params (shape in square brackets):
+        Indices: [tokens top-k] router's tok-k output
+        Sources: [local_experts, num_weight_tensors] "home" address of the resident & offloaded experts that belong to this rank
+        Resident: [local_experts] boolean mask indicating whether each local expert permanently lives in VRAM (i.e. is "resident")
+        Destinations: [cache_slots num_weight_tensors] VRAM addresses for every cache slot (x num weight tensors per expert)
+
+    LRU cache state (updated each call):
+        SlotExperts: [cache_slots] current expert ID assigned to each cache slot (-1 if empty)
+        Ages: [cache_slots] last Clock tick each slot was used (for LRU eviction)
+        Clock: scalar, just an int that gets incremented every time the kernel runs, used to update Ages
+
+    Outputs (Written each call):
+        CopyExperts: [cache_slots] which local expert to copy into each slot
+        Pointers: [total_num_experts num_weight_tensors] Contains pointers for GEMM for chosen experts that point
+            to either a resident VRAM slot, a cache slot, or directly from host memory
+        Experts: [local_experts] global ids of active experts (packed at front of vector)
+        Counts: [local_experts] number of tokens routed to each active expert (same order as Experts)
+        Rows: [local_experts CAPACITY] list of route indices (positions in flat Indices) ???
+
+    Compile-time constants:
+        START: int, Global ID of this rank’s first local expert, used to convert local index e into global ID START + e
+        LOCAL: int, number of local experts
+        SLOTS: int, number of cache slots
+        STRIDE: int, Number of weight banks per expert (B):
+            2 for BF16, 6 for NVFP4 (weight, scale and scale2 for both gate_up and down).
+        ROUTES: int, number of routes: tokens * top-k
+        CAPACITY: int, the most routes one group can hold (ROUTES rounded up to a power of two and never shrunk).
+        E: int, LOCAL rounded up to a power of two, because tl.arange needs power-of-two sizes.
+        S: int, SLOTS rounded up to a power of two (at least 1).
+        R: int, ROUTES rounded up to a power of two.
     """
     # Step 1: count number of tokens routed to each expert; mark active experts
     # we're simply consuming the output of TopKRouter

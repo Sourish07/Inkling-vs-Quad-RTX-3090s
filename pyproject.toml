@@ -11,6 +11,7 @@ dependencies = [
     "huggingface-hub>=1.21.0",
     "jaxtyping>=0.3.10",
     "loguru>=0.7.3",
+    "nvidia-cutlass-dsl[cu13]>=4.3.5",
     "nvidia-modelopt>=0.47.0",
     "requests>=2.34.2",
     "torch>=2.13.0",
@@ -35,6 +36,10 @@ dev = [
 [tool.pytest.ini_options]
 # Tests import `my_inkling`, so put the repo root on sys.path.
 pythonpath = ["."]
+
+[tool.ty.environment]
+# cutlass uses an executable .pth entry that ty cannot follow.
+extra-paths = [".venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/dsl_packages"]
 
 [tool.ty.rules]
 all = "ignore"

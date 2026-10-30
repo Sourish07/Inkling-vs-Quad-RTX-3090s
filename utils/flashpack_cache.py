@@ -79,24 +79,33 @@ def _direct_reader(path):
         os.close(fd)
 
 
-def load_non_expert_state_dict(rank, device):
+def _span(blocks, record):
+    """Byte offset and length of a record in its file, and its dtype."""
+    dtype, offset, _ = blocks[record["macroblock"]]
+    size = torch.empty((), dtype=dtype).element_size()
+    return offset + record["offset"] * size, record["length"] * size, dtype
+
+
+def load_non_expert_state_dict(rank, device, pinned=()):
     """
-    Read this rank's non-experts onto device; tensors are views of one block per dtype.
+    Read this rank's non-experts, one allocation per parameter.
+
+    Parameters whose name ends with one of `pinned` stay in pinned host memory;
+    the rest go to device.
     """
     path = FLASHPACK_DIR / f"non-experts-rank-{rank}.flashpack"
     blocks, records = _layout(path)
-    storage = []
+    state = {}
     with _direct_reader(path) as fill:
-        for dtype, offset, length in blocks:
-            block = torch.empty(length, dtype=torch.uint8, device=device)
-            fill(offset, block)
-            storage.append(block.view(dtype))
-    return {
-        r["name"]: storage[r["macroblock"]]
-        .narrow(0, r["offset"], r["length"])
-        .reshape(r["shape"])
-        for r in records
-    }
+        for record in sorted(records, key=lambda r: _span(blocks, r)[0]):
+            start, length, dtype = _span(blocks, record)
+            if record["name"].endswith(tuple(pinned)):
+                value = torch.empty(length, dtype=torch.uint8, pin_memory=True)
+            else:
+                value = torch.empty(length, dtype=torch.uint8, device=device)
+            fill(start, value)
+            state[record["name"]] = value.view(dtype).reshape(record["shape"])
+    return state
 
 
 def load_expert_state_dict(rank, device, gpu_experts_per_rank, full_tp=False):
@@ -112,11 +121,6 @@ def load_expert_state_dict(rank, device, gpu_experts_per_rank, full_tp=False):
     prefix = "experts-tp" if full_tp else "experts"
     path = FLASHPACK_DIR / f"{prefix}-rank-{rank}.flashpack"
     blocks, records = _layout(path)
-
-    def span(record):
-        dtype, offset, _ = blocks[record["macroblock"]]
-        size = torch.empty((), dtype=dtype).element_size()
-        return offset + record["offset"] * size, record["length"] * size, dtype
 
     def expert_id(record):
         return int(record["name"].rsplit("/", 1)[1])
@@ -134,7 +138,9 @@ def load_expert_state_dict(rank, device, gpu_experts_per_rank, full_tp=False):
             for key in placement_map:
                 placement_map[key] = set(placement_map[key][:gpu_experts_per_rank])
     else:
-        logger.info(f"Using default, naive placement. Keeping first {gpu_experts_per_rank} experts resident.")
+        logger.info(
+            f"Using default, naive placement. Keeping first {gpu_experts_per_rank} experts resident."
+        )
         # placement_map: dict[int, list[int]]
         # maps layer id to the list of expert ids to keep resident on GPU
         placement_map = {
@@ -144,8 +150,8 @@ def load_expert_state_dict(rank, device, gpu_experts_per_rank, full_tp=False):
 
     state = {}
     with _direct_reader(path) as fill:
-        for record in sorted(records, key=lambda r: span(r)[0]):
-            start, length, dtype = span(record)
+        for record in sorted(records, key=lambda r: _span(blocks, r)[0]):
+            start, length, dtype = _span(blocks, record)
             layer = layer_id(record)
             if layer == "2" or expert_id(record) in placement_map[layer]:
                 value = torch.empty(length, dtype=torch.uint8, device=device)
